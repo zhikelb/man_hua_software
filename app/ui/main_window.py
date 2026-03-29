@@ -1,0 +1,1015 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from PyQt6.QtCore import QMimeData, QPoint, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QIcon, QKeyEvent, QKeySequence, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QKeySequenceEdit,
+    QSpinBox,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.config import save_config
+from app.services.import_service import ImportService
+from app.services.library_service import LibraryService, SeriesItem
+from app.services.reader_service import ReaderService
+from app.services.export_service import ExportService
+from app.ui.import_dialog import ImportDialog
+from app.ui.edit_series_dialog import EditSeriesDialog
+from app.ui.reader_window import ReaderWindow
+from app.utils.global_hotkey import WindowsGlobalHotkeyManager
+
+
+class GroupListWidget(QListWidget):
+    series_dropped_to_category = pyqtSignal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setDragEnabled(False)
+        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+        self.setDefaultDropAction(Qt.DropAction.IgnoreAction)
+
+    def dragEnterEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime and mime.hasText() and mime.text().startswith("series:"):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime and mime.hasText() and mime.text().startswith("series:"):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        mime = event.mimeData()
+        if not (mime and mime.hasText() and mime.text().startswith("series:")):
+            event.ignore()
+            return
+
+        payload = mime.text().split(":", 1)
+        if len(payload) != 2 or not payload[1].isdigit():
+            event.ignore()
+            return
+
+        target_item = self.itemAt(event.position().toPoint())
+        if target_item is None:
+            event.ignore()
+            return
+
+        row = self.row(target_item)
+        target_code = 0
+        if row <= 3:
+            target_code = -(row + 1)
+        else:
+            group_id = target_item.data(Qt.ItemDataRole.UserRole)
+            if group_id is None:
+                event.ignore()
+                return
+            target_code = int(group_id)
+
+        self.series_dropped_to_category.emit(int(payload[1]), target_code)
+        event.acceptProposedAction()
+
+
+class SeriesListWidget(QListWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._drag_start_pos: QPoint | None = None
+        self._drag_series_id: int | None = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            item = self.itemAt(event.pos())
+            if item is not None:
+                series_id = item.data(Qt.ItemDataRole.UserRole)
+                if series_id is not None:
+                    self._drag_start_pos = event.pos()
+                    self._drag_series_id = int(series_id)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            event.buttons() & Qt.MouseButton.RightButton
+            and self._drag_start_pos is not None
+            and self._drag_series_id is not None
+        ):
+            distance = (event.pos() - self._drag_start_pos).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                drag = QDrag(self)
+                mime = QMimeData()
+                mime.setText(f"series:{self._drag_series_id}")
+                drag.setMimeData(mime)
+                drag.exec(Qt.DropAction.CopyAction)
+                self._drag_start_pos = None
+                self._drag_series_id = None
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            self._drag_start_pos = None
+            self._drag_series_id = None
+        super().mouseReleaseEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(
+        self,
+        import_service: ImportService,
+        library_service: LibraryService,
+        reader_service: ReaderService,
+        export_service: ExportService,
+        hash_check: bool,
+        duplicate_policy: str,
+        config: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.import_service = import_service
+        self.library_service = library_service
+        self.reader_service = reader_service
+        self.export_service = export_service
+        self.hash_check = hash_check
+        self.duplicate_policy = duplicate_policy
+        self.config = config
+        self.reader_windows: list[ReaderWindow] = []
+        self.global_hotkey_manager: WindowsGlobalHotkeyManager | None = None
+
+        self.setWindowTitle("漫画软件 MVP")
+        self.resize(1200, 800)
+
+        self.current_category = "all"
+        self.current_custom_group_id: int | None = None
+
+        self._setup_ui()
+        self._setup_global_hotkeys()
+        self.reload_library()
+
+    def _event_to_shortcut(self, event: QKeyEvent) -> str:
+        if event.key() in (
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+        ):
+            return ""
+        seq = QKeySequence(event.keyCombination())
+        return seq.toString(QKeySequence.SequenceFormat.PortableText)
+
+    def _show_main_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _toggle_main_window(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self._show_main_window()
+
+    def _setup_global_hotkeys(self) -> bool:
+        reader_cfg = self.config.setdefault("reader", {})
+        key_cfg = reader_cfg.setdefault("key_bindings", {})
+        seq = str(
+            (
+                key_cfg.get("global_toggle_window", key_cfg.get("global_show_window", ["Ctrl+Alt+M"]))
+                or ["Ctrl+Alt+M"]
+            )[0]
+        )
+
+        if self.global_hotkey_manager is None:
+            self.global_hotkey_manager = WindowsGlobalHotkeyManager()
+        else:
+            self.global_hotkey_manager.unregister_all()
+
+        ok = self.global_hotkey_manager.register_shortcut(seq, self._toggle_main_window)
+        if not ok:
+            self.statusBar().showMessage("全局快捷键注册失败，可能已被占用", 5000)
+            return False
+        return True
+
+    def _normalized_shortcuts(self, key_cfg: dict[str, Any], key: str, default_keys: list[str]) -> set[str]:
+        raw = key_cfg.get(key, default_keys)
+        if isinstance(raw, str):
+            values = [raw]
+        elif isinstance(raw, list):
+            values = [str(v) for v in raw]
+        else:
+            values = default_keys
+        return {v.strip() for v in values if v and v.strip()}
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key_cfg = self.config.setdefault("reader", {}).setdefault("key_bindings", {})
+        toggle_shortcuts = self._normalized_shortcuts(
+            key_cfg,
+            "toggle_window",
+            key_cfg.get("show_window", ["Ctrl+Shift+S"]),
+        )
+
+        pressed = self._event_to_shortcut(event)
+        if pressed in toggle_shortcuts:
+            self._toggle_main_window()
+            return
+
+        super().keyPressEvent(event)
+
+    def _apply_series_grid_metrics(self) -> None:
+        ui_cfg = self.config.setdefault("ui", {})
+        icon_width = int(ui_cfg.get("icon_size", 140))
+        icon_height = int(icon_width * 1.357)
+        grid_width = int(ui_cfg.get("grid_cell_width", max(icon_width + 24, 168)))
+        grid_height = int(ui_cfg.get("grid_cell_height", icon_height + 90))
+
+        self.series_list.setIconSize(QSize(icon_width, icon_height))
+        self.series_list.setGridSize(QSize(grid_width, grid_height))
+
+    def _setup_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QHBoxLayout(root)
+
+        splitter = QSplitter()
+        layout.addWidget(splitter)
+
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索漫画/作者/标签...")
+        self.search_edit.textChanged.connect(self.reload_library)
+
+        import_button = QPushButton("导入漫画")
+        import_button.clicked.connect(self.open_import_dialog)
+
+        add_group_button = QPushButton("新建分组")
+        add_group_button.clicked.connect(self.add_group)
+
+        manage_group_button = QPushButton("管理分组")
+        manage_group_button.clicked.connect(self.open_group_manager_dialog)
+
+        self.category_list = GroupListWidget()
+        self.category_list.addItem("全部")
+        self.category_list.addItem("最喜欢")
+        self.category_list.addItem("未读")
+        self.category_list.addItem("已读")
+        self.category_list.currentRowChanged.connect(self.on_category_changed)
+        self.category_list.series_dropped_to_category.connect(self.on_series_dropped_to_category)
+
+        side_layout.addWidget(self.search_edit)
+        side_layout.addWidget(import_button)
+        side_layout.addWidget(add_group_button)
+        side_layout.addWidget(manage_group_button)
+        side_layout.addWidget(QLabel("分类"))
+        side_layout.addWidget(self.category_list)
+
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+
+        self.series_list = SeriesListWidget()
+        self.series_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.series_list.setMovement(QListWidget.Movement.Static)
+        self.series_list.setWrapping(True)
+        self.series_list.setWordWrap(True)
+        self.series_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.series_list.setSpacing(14)
+        self._apply_series_grid_metrics()
+        self.series_list.itemClicked.connect(self.open_reader_for_item)
+        self.series_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.series_list.customContextMenuRequested.connect(self.show_series_context_menu)
+
+        center_layout.addWidget(self.series_list)
+
+        splitter.addWidget(side)
+        splitter.addWidget(center)
+        splitter.setSizes([260, 900])
+
+        self.statusBar().showMessage("就绪")
+        self._setup_menus()
+
+    def _setup_menus(self) -> None:
+        menu_bar = self.menuBar()
+
+        file_menu = menu_bar.addMenu("文件")
+        import_action = QAction("导入漫画", self)
+        import_action.triggered.connect(self.open_import_dialog)
+        file_menu.addAction(import_action)
+
+        file_menu.addSeparator()
+        backup_action = QAction("备份所有数据", self)
+        backup_action.triggered.connect(self.backup_all_data)
+        file_menu.addAction(backup_action)
+
+        export_series_action = QAction("导出当前漫画", self)
+        export_series_action.triggered.connect(self.export_selected_series)
+        file_menu.addAction(export_series_action)
+
+        file_menu.addSeparator()
+        exit_action = QAction("退出", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        settings_menu = menu_bar.addMenu("设置")
+        import_settings_action = QAction("导入设置", self)
+        import_settings_action.triggered.connect(self.open_import_settings_dialog)
+        settings_menu.addAction(import_settings_action)
+
+        reader_key_action = QAction("阅读按键设置", self)
+        reader_key_action.triggered.connect(self.open_reader_key_settings_dialog)
+        settings_menu.addAction(reader_key_action)
+
+        ui_settings_action = QAction("界面设置", self)
+        ui_settings_action.triggered.connect(self.open_ui_settings_dialog)
+        settings_menu.addAction(ui_settings_action)
+
+        group_manage_action = QAction("分组管理", self)
+        group_manage_action.triggered.connect(self.open_group_manager_dialog)
+        settings_menu.addAction(group_manage_action)
+
+    def backup_all_data(self) -> None:
+        """备份所有数据"""
+        try:
+            backup_path = self.export_service.backup_all_data()
+            QMessageBox.information(
+                self,
+                "备份完成",
+                f"所有数据已备份到:\n{backup_path}",
+                QMessageBox.StandardButton.Ok,
+            )
+            self.statusBar().showMessage("备份完成", 3000)
+        except Exception as exc:
+            self._show_error("备份失败", str(exc))
+
+    def export_selected_series(self) -> None:
+        """导出当前选择的漫画"""
+        item = self.series_list.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "提示", "请先选择要导出的漫画")
+            return
+
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        series_name = item.text().split("\n", 1)[0].replace("★ ", "")
+
+        export_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择导出目录",
+            str(Path.home()),
+        )
+
+        if not export_dir:
+            return
+
+        try:
+            output_path = Path(export_dir) / f"{series_name}"
+            self.export_service.export_series_data(series_id, output_path, copy_files=True)
+            QMessageBox.information(
+                self,
+                "导出完成",
+                f"漫画已导出到:\n{output_path}",
+                QMessageBox.StandardButton.Ok,
+            )
+            self.statusBar().showMessage("导出完成", 3000)
+        except Exception as exc:
+            self._show_error("导出失败", str(exc))
+
+    def _show_error(self, title: str, message: str) -> None:
+        QMessageBox.warning(self, title, message)
+
+    def open_import_dialog(self) -> None:
+        dialog = ImportDialog(self)
+        if dialog.exec() != ImportDialog.DialogCode.Accepted:
+            return
+
+        request = dialog.build_request()
+        try:
+            results = self.import_service.import_auto_folder(
+                request.folder,
+                author=request.author,
+                tags=request.tags,
+                hash_check=self.hash_check,
+                duplicate_policy=self.duplicate_policy,
+                custom_name=request.custom_name,
+            )
+            self.reload_library()
+
+            imported_count = sum(1 for r in results if r.imported)
+            failed_count = sum(1 for r in results if not r.imported)
+            if failed_count == 0:
+                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集", 3500)
+            else:
+                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集，跳过/失败 {failed_count} 集", 4500)
+        except Exception as exc:
+            self._show_error("导入失败", str(exc))
+
+    def open_import_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("导入设置")
+        layout = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        hash_check = QCheckBox("启用重复内容哈希检测")
+        hash_check.setChecked(self.hash_check)
+
+        duplicate_policy = QComboBox()
+        duplicate_policy.addItem("重复内容跳过", "skip")
+        duplicate_policy.addItem("重复内容报错", "error")
+        duplicate_policy.addItem("允许重复内容", "allow")
+        idx = duplicate_policy.findData(self.duplicate_policy)
+        if idx >= 0:
+            duplicate_policy.setCurrentIndex(idx)
+
+        form.addRow("哈希检测", hash_check)
+        form.addRow("重复策略", duplicate_policy)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.hash_check = hash_check.isChecked()
+        self.duplicate_policy = str(duplicate_policy.currentData())
+
+        import_cfg = self.config.setdefault("import", {})
+        import_cfg["hash_check_on_duplicate"] = self.hash_check
+        import_cfg["duplicate_content_policy"] = self.duplicate_policy
+        save_config(self.config)
+
+    def open_ui_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("界面设置")
+        dialog.resize(400, 250)
+        layout = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+
+        # 图标大小设置
+        icon_size_spin = QSpinBox()
+        icon_size_spin.setMinimum(80)
+        icon_size_spin.setMaximum(300)
+        icon_size_spin.setValue(int(self.config["ui"].get("icon_size", 140)))
+        icon_size_spin.setToolTip("漫画表示图标的宽度 (像素)")
+
+        grid_width_spin = QSpinBox()
+        grid_width_spin.setMinimum(140)
+        grid_width_spin.setMaximum(500)
+        grid_width_spin.setValue(int(self.config["ui"].get("grid_cell_width", 180)))
+
+        grid_height_spin = QSpinBox()
+        grid_height_spin.setMinimum(180)
+        grid_height_spin.setMaximum(700)
+        grid_height_spin.setValue(int(self.config["ui"].get("grid_cell_height", 290)))
+        
+        # 排序方式设置
+        sort_by_combo = QComboBox()
+        sort_by_combo.addItem("最近更新", "updated_at")
+        sort_by_combo.addItem("漫画名称", "name")
+        sort_by_combo.addItem("作者", "author")
+        sort_by_combo.addItem("集数", "episodes")
+        
+        current_sort = str(self.config["ui"].get("sort_by", "updated_at"))
+        idx = sort_by_combo.findData(current_sort)
+        if idx >= 0:
+            sort_by_combo.setCurrentIndex(idx)
+        
+        # 排序顺序设置
+        sort_order_combo = QComboBox()
+        sort_order_combo.addItem("降序 (从新到旧)", "desc")
+        sort_order_combo.addItem("升序 (从旧到新)", "asc")
+        
+        current_order = str(self.config["ui"].get("sort_order", "desc"))
+        idx = sort_order_combo.findData(current_order)
+        if idx >= 0:
+            sort_order_combo.setCurrentIndex(idx)
+        
+        form.addRow("图标大小(宽度)", icon_size_spin)
+        form.addRow("网格单元宽度", grid_width_spin)
+        form.addRow("网格单元高度", grid_height_spin)
+        form.addRow("排序方式", sort_by_combo)
+        form.addRow("排序顺序", sort_order_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        ui_cfg = self.config.setdefault("ui", {})
+        ui_cfg["icon_size"] = icon_size_spin.value()
+        ui_cfg["grid_cell_width"] = grid_width_spin.value()
+        ui_cfg["grid_cell_height"] = grid_height_spin.value()
+        ui_cfg["sort_by"] = sort_by_combo.currentData()
+        ui_cfg["sort_order"] = sort_order_combo.currentData()
+        save_config(self.config)
+
+        self._apply_series_grid_metrics()
+        self.reload_library()
+        self.statusBar().showMessage("界面设置已更新", 3000)
+
+    def open_reader_key_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("快捷键设置")
+        dialog.resize(500, 300)
+        layout = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        reader_cfg = self.config.setdefault("reader", {})
+        key_cfg = reader_cfg.setdefault("key_bindings", {})
+
+        hide_window_edit = QKeySequenceEdit()
+        hide_window_edit.setKeySequence(
+            QKeySequence(
+                str(
+                    (
+                        key_cfg.get("toggle_window", key_cfg.get("show_window", ["Ctrl+Shift+S"]))
+                        or ["Ctrl+Shift+S"]
+                    )[0]
+                )
+            )
+        )
+
+        fullscreen_edit = QKeySequenceEdit()
+        fullscreen_edit.setKeySequence(
+            QKeySequence(
+                str(
+                    (
+                        key_cfg.get("reader_toggle_fullscreen", key_cfg.get("reader_fullscreen", ["F"]))
+                        or ["F"]
+                    )[0]
+                )
+            )
+        )
+
+        note = QLabel("说明：方向键与 PgUp/PgDn 默认翻页且不可更改。点击输入框后直接按下按键/组合键即可记录。")
+        note.setWordWrap(True)
+
+        global_show_edit = QKeySequenceEdit()
+        global_show_edit.setKeySequence(
+            QKeySequence(
+                str(
+                    (
+                        key_cfg.get("global_toggle_window", key_cfg.get("global_show_window", ["Ctrl+Alt+M"]))
+                        or ["Ctrl+Alt+M"]
+                    )[0]
+                )
+            )
+        )
+
+        form.addRow("软件显示/隐藏(应用内切换)", hide_window_edit)
+        form.addRow("软件显示/隐藏(全局切换)", global_show_edit)
+        form.addRow("阅读窗口最大化/窗口化", fullscreen_edit)
+        layout.addWidget(note)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        toggle_seq = hide_window_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+        global_show_seq = global_show_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+        fullscreen_seq = fullscreen_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+
+        toggle_seq = toggle_seq or "Ctrl+Shift+S"
+        global_show_seq = global_show_seq or "Ctrl+Alt+M"
+        fullscreen_seq = fullscreen_seq or "F"
+
+        fixed_reader_keys = {
+            "Right",
+            "Left",
+            "Up",
+            "Down",
+            "PgUp",
+            "PgDown",
+            "PageUp",
+            "PageDown",
+            "Space",
+        }
+        if fullscreen_seq in fixed_reader_keys:
+            QMessageBox.warning(self, "按键冲突", "阅读窗口切换键与固定翻页键冲突，请更换按键")
+            return
+
+        if len({toggle_seq, global_show_seq, fullscreen_seq}) < 3:
+            QMessageBox.warning(self, "按键冲突", "快捷键之间存在冲突，请设置为不同按键")
+            return
+
+        key_cfg["toggle_window"] = [toggle_seq]
+        key_cfg["global_toggle_window"] = [global_show_seq]
+        key_cfg["reader_toggle_fullscreen"] = [fullscreen_seq]
+
+        # 兼容旧配置字段，统一同步为单键切换模型。
+        key_cfg["hide_window"] = [toggle_seq]
+        key_cfg["show_window"] = [toggle_seq]
+        key_cfg["global_show_window"] = [global_show_seq]
+        key_cfg["reader_fullscreen"] = [fullscreen_seq]
+        key_cfg["reader_windowed"] = [fullscreen_seq]
+
+        save_config(self.config)
+        if not self._setup_global_hotkeys():
+            QMessageBox.warning(self, "全局快捷键冲突", "全局快捷键注册失败，可能被其他软件占用")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.global_hotkey_manager is not None:
+            self.global_hotkey_manager.unregister_all()
+        super().closeEvent(event)
+
+    def reload_library(self) -> None:
+        removed = self.library_service.prune_missing_series()
+        if removed > 0:
+            self.statusBar().showMessage(f"检测到 {removed} 部漫画源文件已丢失，已自动移除", 5000)
+
+        self._reload_custom_groups()
+        keyword = self.search_edit.text().strip()
+        
+        sort_by = str(self.config["ui"].get("sort_by", "updated_at"))
+        sort_order = str(self.config["ui"].get("sort_order", "desc"))
+
+        if self.current_category == "group" and self.current_custom_group_id is not None:
+            items = self.library_service.list_series_by_group(self.current_custom_group_id)
+        else:
+            items = self.library_service.list_series(self.current_category, keyword, sort_by, sort_order)
+
+        self.series_list.clear()
+        for item in items:
+            self.series_list.addItem(self._build_series_item(item))
+
+    def _build_series_item(self, series: SeriesItem) -> QListWidgetItem:
+        title = f"{series.name}\n作者: {series.author or '未知'}\n共{series.total_episodes}集"
+        
+        # 获取阅读进度
+        progress = self.library_service.get_reading_progress(series.id)
+        if progress:
+            read_images, total_images = progress
+            percentage = int((read_images / total_images) * 100) if total_images > 0 else 0
+            title += f"\n已读{percentage}%"
+        
+        if series.is_favorite:
+            title = f"★ {title}"
+
+        list_item = QListWidgetItem(title)
+        list_item.setData(Qt.ItemDataRole.UserRole, series.id)
+
+        cover_icon = self._build_cover_icon(series.cover_path)
+        list_item.setIcon(cover_icon)
+        return list_item
+
+    def _build_cover_icon(self, cover_path: str | None) -> QIcon:
+        icon_width = int(self.config.setdefault("ui", {}).get("icon_size", 140))
+        icon_height = int(icon_width * 1.357)
+        if cover_path and Path(cover_path).exists():
+            pix = QPixmap(cover_path)
+            if not pix.isNull():
+                scaled = pix.scaled(
+                    icon_width,
+                    icon_height,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                return QIcon(scaled)
+
+        fallback = QPixmap(icon_width, icon_height)
+        fallback.fill(Qt.GlobalColor.lightGray)
+        return QIcon(fallback)
+
+    def open_reader_for_item(self, item: QListWidgetItem) -> None:
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        series_name = item.text().split("\n", 1)[0].replace("★ ", "")
+        try:
+            window = ReaderWindow(self.reader_service, series_id, series_name, self.config.get("reader", {}))
+            window.progress_changed.connect(self.on_reader_progress_changed)
+            window.show()
+            self.reader_windows.append(window)
+        except Exception as exc:
+            self._show_error("无法打开阅读器", str(exc))
+
+    def on_reader_progress_changed(self, _series_id: int) -> None:
+        self.reload_library()
+
+    def show_series_context_menu(self, pos: QPoint) -> None:
+        item = self.series_list.itemAt(pos)
+        if item is None:
+            return
+
+        self.series_list.setCurrentItem(item)
+        menu = QMenu(self)
+
+        edit_action = QAction("编辑属性", self)
+        edit_action.triggered.connect(self.edit_selected_series)
+        menu.addAction(edit_action)
+
+        favorite_action = QAction("切换收藏状态", self)
+        favorite_action.triggered.connect(self.toggle_selected_favorite)
+        menu.addAction(favorite_action)
+
+        mark_read_action = QAction("标记为已读", self)
+        mark_read_action.triggered.connect(self.mark_selected_series_as_read)
+        menu.addAction(mark_read_action)
+
+        mark_unread_action = QAction("标记为未读", self)
+        mark_unread_action.triggered.connect(self.mark_selected_series_as_unread)
+        menu.addAction(mark_unread_action)
+
+        groups = self.library_service.list_custom_groups()
+        if groups:
+            move_menu = menu.addMenu("移动到分组")
+            for row in groups:
+                group_id = int(row["id"])
+                group_name = str(row["name"])
+                action = QAction(group_name, self)
+                action.triggered.connect(
+                    lambda checked=False, gid=group_id: self.move_selected_series_to_group(gid)
+                )
+                move_menu.addAction(action)
+
+        menu.addSeparator()
+        delete_action = QAction("删除漫画", self)
+        delete_action.triggered.connect(self.delete_selected_series)
+        menu.addAction(delete_action)
+
+        menu.exec(self.series_list.mapToGlobal(pos))
+
+    def edit_selected_series(self) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        details = self.library_service.get_series_details(series_id)
+        if details is None:
+            return
+
+        groups = [
+            (int(row["id"]), str(row["name"]))
+            for row in self.library_service.list_custom_groups()
+        ]
+
+        dialog = EditSeriesDialog(
+            series_id,
+            details["name"],
+            details["author"],
+            details["tags"],
+            groups,
+            details.get("group_id"),
+            self,
+        )
+        if dialog.exec() != EditSeriesDialog.DialogCode.Accepted:
+            return
+
+        name, author, tags, group_id = dialog.get_edited_data()
+        try:
+            self.library_service.edit_series(series_id, name, author, tags)
+            if group_id is None:
+                self.library_service.clear_series_group(series_id)
+            else:
+                self.library_service.move_series_to_group(series_id, int(group_id))
+            self.reload_library()
+            self.statusBar().showMessage("漫画属性已更新", 3000)
+        except Exception as exc:
+            self._show_error("更新失败", str(exc))
+
+    def mark_selected_series_as_read(self) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        try:
+            self.library_service.mark_series_as_read(series_id)
+            self.reload_library()
+            self.statusBar().showMessage("已标记为已读", 3000)
+        except Exception as exc:
+            self._show_error("标记失败", str(exc))
+
+    def mark_selected_series_as_unread(self) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        try:
+            self.library_service.mark_series_as_unread(series_id)
+            self.reload_library()
+            self.statusBar().showMessage("已标记为未读", 3000)
+        except Exception as exc:
+            self._show_error("标记失败", str(exc))
+
+    def delete_selected_series(self) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        series_name = item.text().split("\n", 1)[0].replace("★ ", "")
+        resp = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除漫画《{series_name}》及其所有集数和阅读记录吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        self.library_service.delete_series(series_id)
+        self.reload_library()
+        self.statusBar().showMessage("已删除漫画", 3000)
+
+    def move_selected_series_to_group(self, group_id: int) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        self.library_service.move_series_to_group(series_id, group_id)
+        self.reload_library()
+
+    def on_series_dropped_to_category(self, series_id: int, target_code: int) -> None:
+        if target_code == -1:
+            return
+        if target_code == -2:
+            self.library_service.set_favorite(series_id, True)
+        elif target_code == -3:
+            self.library_service.clear_reading_progress(series_id)
+        elif target_code == -4:
+            self.library_service.mark_series_as_read(series_id)
+        elif target_code > 0:
+            self.library_service.move_series_to_group(series_id, target_code)
+        self.reload_library()
+
+    def toggle_selected_favorite(self) -> None:
+        item = self.series_list.currentItem()
+        if item is None:
+            return
+        series_id = int(item.data(Qt.ItemDataRole.UserRole))
+        is_fav = item.text().startswith("★")
+        self.library_service.set_favorite(series_id, not is_fav)
+        self.reload_library()
+
+    def on_category_changed(self, row: int) -> None:
+        if row < 0:
+            return
+
+        if row == 0:
+            self.current_category = "all"
+            self.current_custom_group_id = None
+        elif row == 1:
+            self.current_category = "favorite"
+            self.current_custom_group_id = None
+        elif row == 2:
+            self.current_category = "unread"
+            self.current_custom_group_id = None
+        elif row == 3:
+            self.current_category = "read"
+            self.current_custom_group_id = None
+        else:
+            item = self.category_list.item(row)
+            group_id = item.data(Qt.ItemDataRole.UserRole)
+            self.current_category = "group"
+            self.current_custom_group_id = int(group_id)
+        self.reload_library()
+
+    def add_group(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建分组", "分组名")
+        if not ok or not name.strip():
+            return
+        self.library_service.create_group(name)
+        self._reload_custom_groups()
+
+    def open_group_manager_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("分组管理")
+        dialog.resize(420, 360)
+
+        layout = QVBoxLayout(dialog)
+        group_list = QListWidget()
+        layout.addWidget(group_list)
+
+        row = QHBoxLayout()
+        add_btn = QPushButton("新建")
+        rename_btn = QPushButton("重命名")
+        delete_btn = QPushButton("删除")
+        close_btn = QPushButton("关闭")
+        row.addWidget(add_btn)
+        row.addWidget(rename_btn)
+        row.addWidget(delete_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+        def selected_group() -> tuple[int, str] | None:
+            item = group_list.currentItem()
+            if item is None:
+                return None
+            gid = item.data(Qt.ItemDataRole.UserRole)
+            if gid is None:
+                return None
+            return int(gid), item.text()
+
+        def refresh() -> None:
+            group_list.clear()
+            for group in self.library_service.list_custom_groups():
+                item = QListWidgetItem(str(group["name"]))
+                item.setData(Qt.ItemDataRole.UserRole, int(group["id"]))
+                group_list.addItem(item)
+
+        def do_add() -> None:
+            name, ok = QInputDialog.getText(dialog, "新建分组", "分组名")
+            if not ok or not name.strip():
+                return
+            self.library_service.create_group(name)
+            refresh()
+
+        def do_rename() -> None:
+            selected = selected_group()
+            if selected is None:
+                QMessageBox.information(dialog, "提示", "请先选择分组")
+                return
+            gid, old_name = selected
+            name, ok = QInputDialog.getText(dialog, "重命名分组", "新名称", text=old_name)
+            if not ok or not name.strip():
+                return
+            self.library_service.rename_group(gid, name)
+            refresh()
+
+        def do_delete() -> None:
+            selected = selected_group()
+            if selected is None:
+                QMessageBox.information(dialog, "提示", "请先选择分组")
+                return
+            gid, name = selected
+            resp = QMessageBox.question(
+                dialog,
+                "确认删除",
+                f"确定删除分组“{name}”？\n已归属该分组的漫画会变为未分组。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+            self.library_service.delete_group(gid)
+            refresh()
+
+        add_btn.clicked.connect(do_add)
+        rename_btn.clicked.connect(do_rename)
+        delete_btn.clicked.connect(do_delete)
+        close_btn.clicked.connect(dialog.accept)
+
+        refresh()
+        dialog.exec()
+        self.reload_library()
+
+    def _reload_custom_groups(self) -> None:
+        prev_row = self.category_list.currentRow()
+        prev_group_id = self.current_custom_group_id if self.current_category == "group" else None
+
+        self.category_list.blockSignals(True)
+        while self.category_list.count() > 4:
+            self.category_list.takeItem(4)
+
+        selected_row = prev_row if 0 <= prev_row <= 3 else 0
+        for idx, row in enumerate(self.library_service.list_custom_groups(), start=4):
+            item = QListWidgetItem(f"分组: {row['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+            self.category_list.addItem(item)
+            if prev_group_id is not None and int(row["id"]) == prev_group_id:
+                selected_row = idx
+
+        self.category_list.setCurrentRow(selected_row)
+        self.category_list.blockSignals(False)

@@ -1,0 +1,59 @@
+{
+  "import": {
+    "default_storage_mode": "reference",
+    "hash_check_on_duplicate": true,
+    "duplicate_content_policy": "skip"
+  },
+  "reader": {
+    "zoom_levels": [
+      50,
+      75,
+      100,
+      125,
+      150,
+      200
+    ],
+    "default_zoom": "fit",
+    "preload_count": 2,
+    "key_bindings": {
+      "toggle_window": [
+        "Ctrl+Shift+S"
+      ],
+      "global_toggle_window": [
+        "Ctrl+Alt+M"
+      ],
+      "reader_toggle_fullscreen": [
+        "F"
+      ],
+      "hide_window": [
+        "Esc"
+      ],
+      "show_window": [
+        "Ctrl+Shift+S"
+      ],
+      "global_show_window": [
+        "Ctrl+Alt+M"
+      ],
+      "reader_fullscreen": [
+        "F"
+      ],
+      "reader_windowed": [
+        "Shift+F"
+      ],
+      "next_image": [
+        "Space"
+      ],
+      "prev_image": [],
+      "toggle_fullscreen": [
+        "F"
+      ]
+    }
+  },
+  "ui": {
+    "icon_size": 140,
+    "grid_cell_width": 180,
+    "grid_cell_height": 290,
+    "sort_by": "updated_at",
+    "sort_order": "desc"
+  }
+}
