@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QAbstractItemView,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -30,7 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.config import save_config
+from app.config import save_config, IMPORT_COPY_ROOT
 from app.services.import_service import ImportService
 from app.services.library_service import LibraryService, SeriesItem
 from app.services.reader_service import ReaderService
@@ -39,6 +40,60 @@ from app.ui.import_dialog import ImportDialog
 from app.ui.edit_series_dialog import EditSeriesDialog
 from app.ui.reader_window import ReaderWindow
 from app.utils.global_hotkey import WindowsGlobalHotkeyManager
+
+
+class DragDropArea(QWidget):
+    """支持拖放导入的区域"""
+    folder_dropped = pyqtSignal(Path)
+    
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setStyleSheet(
+            """
+            DragDropArea {
+                border: 2px dashed #999;
+                border-radius: 5px;
+                background-color: #f5f5f5;
+            }
+            DragDropArea:hover {
+                background-color: #e0e0e0;
+            }
+            """
+        )
+        
+        layout = QVBoxLayout(self)
+        label = QLabel("拖入文件夹导入漫画\n或点击下方\"导入漫画\"按钮")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #666; font-size: 12px;")
+        layout.addWidget(label)
+        self.setMinimumHeight(60)
+    
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dropEvent(self, event) -> None:
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        
+        for url in event.mimeData().urls():
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                self.folder_dropped.emit(path)
+                event.acceptProposedAction()
+                return
+        
+        event.ignore()
 
 
 class GroupListWidget(QListWidget):
@@ -262,8 +317,8 @@ class MainWindow(QMainWindow):
         self.search_edit.setPlaceholderText("搜索漫画/作者/标签...")
         self.search_edit.textChanged.connect(self.reload_library)
 
-        import_button = QPushButton("导入漫画")
-        import_button.clicked.connect(self.open_import_dialog)
+        self.import_button = QPushButton("导入漫画")
+        self.import_button.clicked.connect(self.open_import_dialog)
 
         add_group_button = QPushButton("新建分组")
         add_group_button.clicked.connect(self.add_group)
@@ -280,7 +335,7 @@ class MainWindow(QMainWindow):
         self.category_list.series_dropped_to_category.connect(self.on_series_dropped_to_category)
 
         side_layout.addWidget(self.search_edit)
-        side_layout.addWidget(import_button)
+        side_layout.addWidget(self.import_button)
         side_layout.addWidget(add_group_button)
         side_layout.addWidget(manage_group_button)
         side_layout.addWidget(QLabel("分类"))
@@ -288,6 +343,11 @@ class MainWindow(QMainWindow):
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
+
+        # 添加拖放导入区域
+        self.drag_drop_area = DragDropArea()
+        self.drag_drop_area.folder_dropped.connect(self.on_folder_dropped)
+        center_layout.addWidget(self.drag_drop_area)
 
         self.series_list = SeriesListWidget()
         self.series_list.setViewMode(QListWidget.ViewMode.IconMode)
@@ -310,6 +370,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         self._setup_menus()
 
+    def _set_import_controls_enabled(self, enabled: bool) -> None:
+        self.import_button.setEnabled(enabled)
+        self.drag_drop_area.setEnabled(enabled)
+
     def _setup_menus(self) -> None:
         menu_bar = self.menuBar()
 
@@ -322,6 +386,10 @@ class MainWindow(QMainWindow):
         backup_action = QAction("备份所有数据", self)
         backup_action.triggered.connect(self.backup_all_data)
         file_menu.addAction(backup_action)
+
+        import_backup_action = QAction("导入备份数据", self)
+        import_backup_action.triggered.connect(self.import_backup_data)
+        file_menu.addAction(import_backup_action)
 
         export_series_action = QAction("导出当前漫画", self)
         export_series_action.triggered.connect(self.export_selected_series)
@@ -352,7 +420,14 @@ class MainWindow(QMainWindow):
     def backup_all_data(self) -> None:
         """备份所有数据"""
         try:
-            backup_path = self.export_service.backup_all_data()
+            def on_progress(done: int, total: int) -> None:
+                percent = int((done / total) * 100) if total > 0 else 100
+                self.statusBar().showMessage(f"备份中... {done}/{total} ({percent}%)", 0)
+                QApplication.processEvents()
+
+            self.statusBar().showMessage("备份中...", 0)
+            QApplication.processEvents()
+            backup_path = self.export_service.backup_all_data(progress_callback=on_progress)
             QMessageBox.information(
                 self,
                 "备份完成",
@@ -364,14 +439,78 @@ class MainWindow(QMainWindow):
             self._show_error("备份失败", str(exc))
 
     def export_selected_series(self) -> None:
-        """导出当前选择的漫画"""
-        item = self.series_list.currentItem()
-        if item is None:
-            QMessageBox.warning(self, "提示", "请先选择要导出的漫画")
-            return
+        """导出漫画或分组"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("导出当前漫画")
+        dialog.resize(560, 460)
+        layout = QVBoxLayout(dialog)
 
-        series_id = int(item.data(Qt.ItemDataRole.UserRole))
-        series_name = item.text().split("\n", 1)[0].replace("★ ", "")
+        mode_combo = QComboBox()
+        mode_combo.addItem("导出单部漫画", "series")
+        mode_combo.addItem("导出分组", "group")
+        layout.addWidget(QLabel("导出类型"))
+        layout.addWidget(mode_combo)
+
+        series_list = QListWidget()
+        series_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for idx in range(self.series_list.count()):
+            src_item = self.series_list.item(idx)
+            series_id = src_item.data(Qt.ItemDataRole.UserRole)
+            series_name = str(src_item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+            series_author = str(src_item.data(Qt.ItemDataRole.UserRole + 2) or "").strip()
+            if series_id is None:
+                continue
+            item = QListWidgetItem(f"{series_name}  (作者: {series_author or '未知'})")
+            item.setData(Qt.ItemDataRole.UserRole, int(series_id))
+            series_list.addItem(item)
+
+        group_list = QListWidget()
+        group_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        all_item = QListWidgetItem("全部漫画")
+        all_item.setData(Qt.ItemDataRole.UserRole, ("category", "all"))
+        group_list.addItem(all_item)
+
+        fav_item = QListWidgetItem("最喜欢")
+        fav_item.setData(Qt.ItemDataRole.UserRole, ("category", "favorite"))
+        group_list.addItem(fav_item)
+
+        unread_item = QListWidgetItem("未读")
+        unread_item.setData(Qt.ItemDataRole.UserRole, ("category", "unread"))
+        group_list.addItem(unread_item)
+
+        read_item = QListWidgetItem("已读")
+        read_item.setData(Qt.ItemDataRole.UserRole, ("category", "read"))
+        group_list.addItem(read_item)
+
+        for group in self.library_service.list_custom_groups():
+            item = QListWidgetItem(f"分组: {group['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, ("group", int(group["id"])))
+            group_list.addItem(item)
+        group_list.setCurrentRow(0)
+
+        layout.addWidget(QLabel("漫画列表"))
+        layout.addWidget(series_list)
+        layout.addWidget(QLabel("分组列表"))
+        layout.addWidget(group_list)
+
+        def sync_visibility() -> None:
+            mode = str(mode_combo.currentData())
+            is_series = mode == "series"
+            series_list.setVisible(is_series)
+            group_list.setVisible(not is_series)
+
+        mode_combo.currentIndexChanged.connect(sync_visibility)
+        sync_visibility()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
 
         export_dir = QFileDialog.getExistingDirectory(
             self,
@@ -383,17 +522,106 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            output_path = Path(export_dir) / f"{series_name}"
-            self.export_service.export_series_data(series_id, output_path, copy_files=True)
+            mode = str(mode_combo.currentData())
+            output_root = Path(export_dir)
+            if mode == "series":
+                selected_items = series_list.selectedItems()
+                if not selected_items:
+                    QMessageBox.warning(self, "提示", "请至少选择一部漫画")
+                    return
+                total = len(selected_items)
+                exported_paths: list[Path] = []
+                for idx, selected in enumerate(selected_items, start=1):
+                    series_id = int(selected.data(Qt.ItemDataRole.UserRole))
+                    self.statusBar().showMessage(f"导出中... {idx}/{total}", 0)
+                    QApplication.processEvents()
+
+                    def on_progress(done: int, count: int) -> None:
+                        self.statusBar().showMessage(
+                            f"导出中... {idx}/{total} · 图片 {done}/{count}",
+                            0,
+                        )
+                        QApplication.processEvents()
+
+                    exported_paths.append(
+                        self.export_service.export_series_pretty(series_id, output_root, progress_callback=on_progress)
+                    )
+                msg = f"导出完成，共导出 {len(exported_paths)} 部漫画\n目录: {output_root}"
+            else:
+                selected = group_list.currentItem()
+                if selected is None:
+                    QMessageBox.warning(self, "提示", "请选择要导出的分组")
+                    return
+
+                selected_data = selected.data(Qt.ItemDataRole.UserRole)
+                exported_paths: list[Path]
+                if isinstance(selected_data, tuple) and len(selected_data) == 2:
+                    kind, value = selected_data
+                    if kind == "group":
+                        exported_paths = self.export_service.export_group_pretty(int(value), output_root)
+                    else:
+                        exported_paths = self.export_service.export_category_pretty(str(value), output_root)
+                else:
+                    exported_paths = self.export_service.export_category_pretty("all", output_root)
+                msg = f"导出完成，共导出 {len(exported_paths)} 部漫画\n目录: {output_root}"
+
             QMessageBox.information(
                 self,
                 "导出完成",
-                f"漫画已导出到:\n{output_path}",
+                msg,
                 QMessageBox.StandardButton.Ok,
             )
             self.statusBar().showMessage("导出完成", 3000)
         except Exception as exc:
             self._show_error("导出失败", str(exc))
+
+    def import_backup_data(self) -> None:
+        zip_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择备份文件(可选)",
+            str(Path.home()),
+            "备份压缩包 (*.zip);;所有文件 (*.*)",
+        )
+
+        source_path: Path | None = None
+        if zip_file:
+            source_path = Path(zip_file)
+        else:
+            folder = QFileDialog.getExistingDirectory(self, "选择备份目录(可选)", str(Path.home()))
+            if folder:
+                source_path = Path(folder)
+
+        if source_path is None:
+            return
+
+        try:
+            self._set_import_controls_enabled(False)
+            self.statusBar().showMessage("导入备份数据中...", 0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+
+            results = self.import_service.import_backup_data(
+                source=source_path,
+                hash_check=self.hash_check,
+                duplicate_policy="skip",
+                progress_callback=lambda d, t: (self.statusBar().showMessage(f"导入备份数据中... {d}/{t}", 0), QApplication.processEvents()),
+            )
+            self.reload_library()
+
+            imported_count = sum(1 for r in results if r.imported)
+            failed_count = sum(1 for r in results if not r.imported)
+            log_file = self.import_service.generate_error_log(results, Path.home()) if failed_count > 0 else None
+
+            msg = f"备份导入完成：成功 {imported_count} 集，失败/跳过 {failed_count} 集"
+            if log_file:
+                msg += f"\n\n错误报告：\n{log_file}"
+            QMessageBox.information(self, "导入备份数据", msg)
+            self.statusBar().showMessage(msg, 5000)
+        except Exception as exc:
+            self._show_error("导入备份失败", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._set_import_controls_enabled(True)
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.warning(self, title, message)
@@ -404,7 +632,12 @@ class MainWindow(QMainWindow):
             return
 
         request = dialog.build_request()
+
         try:
+            self._set_import_controls_enabled(False)
+            self.statusBar().showMessage("导入中...", 0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
             results = self.import_service.import_auto_folder(
                 request.folder,
                 author=request.author,
@@ -412,17 +645,31 @@ class MainWindow(QMainWindow):
                 hash_check=self.hash_check,
                 duplicate_policy=self.duplicate_policy,
                 custom_name=request.custom_name,
+                progress_callback=lambda d, t: (self.statusBar().showMessage(f"导入中... {d}/{t}", 0), QApplication.processEvents()),
             )
+
             self.reload_library()
 
             imported_count = sum(1 for r in results if r.imported)
             failed_count = sum(1 for r in results if not r.imported)
-            if failed_count == 0:
-                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集", 3500)
+            
+            # 如果有失败的导入，生成错误日志
+            if failed_count > 0:
+                log_file = self.import_service.generate_error_log(results, request.folder)
+                message = f"导入完成：成功 {imported_count} 集，跳过/失败 {failed_count} 集"
+                if log_file:
+                    message += f"\n\n错误日志已生成：\n{log_file}"
+                    self.statusBar().showMessage(f"{message}", 5000)
+                    QMessageBox.information(self, "导入完成", message)
+                else:
+                    self.statusBar().showMessage(message, 4500)
             else:
-                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集，跳过/失败 {failed_count} 集", 4500)
+                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集", 3500)
         except Exception as exc:
             self._show_error("导入失败", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._set_import_controls_enabled(True)
 
     def open_import_settings_dialog(self) -> None:
         dialog = QDialog(self)
@@ -672,24 +919,42 @@ class MainWindow(QMainWindow):
             self.series_list.addItem(self._build_series_item(item))
 
     def _build_series_item(self, series: SeriesItem) -> QListWidgetItem:
-        title = f"{series.name}\n作者: {series.author or '未知'}\n共{series.total_episodes}集"
-        
-        # 获取阅读进度
         progress = self.library_service.get_reading_progress(series.id)
-        if progress:
-            read_images, total_images = progress
-            percentage = int((read_images / total_images) * 100) if total_images > 0 else 0
-            title += f"\n已读{percentage}%"
-        
-        if series.is_favorite:
-            title = f"★ {title}"
+        title = self._compose_series_title(
+            name=series.name,
+            author=series.author,
+            total_episodes=series.total_episodes,
+            is_favorite=series.is_favorite,
+            progress=progress,
+        )
 
         list_item = QListWidgetItem(title)
         list_item.setData(Qt.ItemDataRole.UserRole, series.id)
+        list_item.setData(Qt.ItemDataRole.UserRole + 1, series.name)
+        list_item.setData(Qt.ItemDataRole.UserRole + 2, series.author)
+        list_item.setData(Qt.ItemDataRole.UserRole + 3, series.total_episodes)
+        list_item.setData(Qt.ItemDataRole.UserRole + 4, series.is_favorite)
 
         cover_icon = self._build_cover_icon(series.cover_path)
         list_item.setIcon(cover_icon)
         return list_item
+
+    def _compose_series_title(
+        self,
+        name: str,
+        author: str,
+        total_episodes: int,
+        is_favorite: bool,
+        progress: tuple[int, int] | None,
+    ) -> str:
+        title = f"{name}\n作者: {author or '未知'}\n共{total_episodes}集"
+        if progress:
+            read_images, total_images = progress
+            percentage = int((read_images / total_images) * 100) if total_images > 0 else 0
+            title += f"\n已读{percentage}%"
+        if is_favorite:
+            title = f"★ {title}"
+        return title
 
     def _build_cover_icon(self, cover_path: str | None) -> QIcon:
         icon_width = int(self.config.setdefault("ui", {}).get("icon_size", 140))
@@ -711,10 +976,17 @@ class MainWindow(QMainWindow):
 
     def open_reader_for_item(self, item: QListWidgetItem) -> None:
         series_id = int(item.data(Qt.ItemDataRole.UserRole))
-        series_name = item.text().split("\n", 1)[0].replace("★ ", "")
+        series_name = str(item.data(Qt.ItemDataRole.UserRole + 1) or "").strip() or item.text().split("\n", 1)[0].replace("★ ", "")
         try:
-            window = ReaderWindow(self.reader_service, series_id, series_name, self.config.get("reader", {}))
+            window = ReaderWindow(
+                self.reader_service,
+                self.library_service,
+                series_id,
+                series_name,
+                self.config.get("reader", {}),
+            )
             window.progress_changed.connect(self.on_reader_progress_changed)
+            window.cover_changed.connect(self.on_reader_cover_changed)
             window.show()
             self.reader_windows.append(window)
         except Exception as exc:
@@ -722,6 +994,63 @@ class MainWindow(QMainWindow):
 
     def on_reader_progress_changed(self, _series_id: int) -> None:
         self.reload_library()
+
+    def on_reader_cover_changed(self, series_id: int) -> None:
+        self.reload_library()
+
+    def _refresh_single_series_cover(self, series_id: int) -> None:
+        for row in range(self.series_list.count()):
+            item = self.series_list.item(row)
+            item_series_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_series_id is None or int(item_series_id) != series_id:
+                continue
+            details = self.library_service.get_series_details(series_id)
+            if details is None:
+                return
+            cover_path = details.get("cover_path")
+            item.setIcon(self._build_cover_icon(str(cover_path) if cover_path else None))
+            return
+
+    def _update_single_series_progress(self, series_id: int) -> None:
+        for row in range(self.series_list.count()):
+            item = self.series_list.item(row)
+            item_series_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_series_id is None or int(item_series_id) != series_id:
+                continue
+
+            progress = self.library_service.get_reading_progress(series_id)
+            has_progress = progress is not None
+            if self.current_category == "unread" and has_progress:
+                self.series_list.takeItem(row)
+                return
+            if self.current_category == "read" and not self.library_service.is_series_fully_read(series_id):
+                self.series_list.takeItem(row)
+                return
+
+            name = str(item.data(Qt.ItemDataRole.UserRole + 1) or "")
+            author = str(item.data(Qt.ItemDataRole.UserRole + 2) or "")
+            total_episodes = int(item.data(Qt.ItemDataRole.UserRole + 3) or 0)
+            is_favorite = bool(item.data(Qt.ItemDataRole.UserRole + 4) or False)
+
+            details = self.library_service.get_series_details(series_id)
+            if details is not None:
+                name = str(details.get("name") or name)
+                author = str(details.get("author") or author)
+                item.setData(Qt.ItemDataRole.UserRole + 1, name)
+                item.setData(Qt.ItemDataRole.UserRole + 2, author)
+                cover_path = details.get("cover_path")
+                item.setIcon(self._build_cover_icon(str(cover_path) if cover_path else None))
+
+            item.setText(
+                self._compose_series_title(
+                    name=name,
+                    author=author,
+                    total_episodes=total_episodes,
+                    is_favorite=is_favorite,
+                    progress=progress,
+                )
+            )
+            return
 
     def show_series_context_menu(self, pos: QPoint) -> None:
         item = self.series_list.itemAt(pos)
@@ -780,6 +1109,9 @@ class MainWindow(QMainWindow):
             (int(row["id"]), str(row["name"]))
             for row in self.library_service.list_custom_groups()
         ]
+        
+        # 获取集数列表
+        episodes = self.library_service.list_episodes(series_id)
 
         dialog = EditSeriesDialog(
             series_id,
@@ -788,18 +1120,51 @@ class MainWindow(QMainWindow):
             details["tags"],
             groups,
             details.get("group_id"),
-            self,
+            episodes=episodes,
+            current_cover_path=details.get("cover_path"),
+            parent=self,
         )
         if dialog.exec() != EditSeriesDialog.DialogCode.Accepted:
             return
 
-        name, author, tags, group_id = dialog.get_edited_data()
+        name, author, tags, group_id, cover_path, episode_updates = dialog.get_edited_data()
         try:
             self.library_service.edit_series(series_id, name, author, tags)
+            
+            # 处理分组更新
             if group_id is None:
                 self.library_service.clear_series_group(series_id)
             else:
                 self.library_service.move_series_to_group(series_id, int(group_id))
+            
+            # 处理每集集名和顺序更新
+            if episode_updates:
+                self.library_service.update_episodes_metadata(series_id, episode_updates)
+            
+            # 处理封面更新
+            if cover_path is not None:
+                # 如果选择了新封面，需要复制到数据目录
+                if cover_path and Path(cover_path).exists() and not str(cover_path).startswith(str(IMPORT_COPY_ROOT)):
+                    import shutil
+                    from datetime import datetime
+                    
+                    # 生成新的封面文件名
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    new_cover_name = f"cover_{series_id}_{timestamp}.jpg"
+                    covers_dir = Path(IMPORT_COPY_ROOT) / "covers"
+                    covers_dir.mkdir(exist_ok=True)
+                    new_cover_path = covers_dir / new_cover_name
+                    
+                    # 复制封面文件
+                    shutil.copy2(cover_path, new_cover_path)
+                    self.library_service.update_series_cover(series_id, str(new_cover_path))
+                elif not cover_path:
+                    # 清空封面
+                    self.library_service.update_series_cover(series_id, None)
+                else:
+                    # 使用已有的封面路径
+                    self.library_service.update_series_cover(series_id, cover_path)
+            
             self.reload_library()
             self.statusBar().showMessage("漫画属性已更新", 3000)
         except Exception as exc:
@@ -873,6 +1238,82 @@ class MainWindow(QMainWindow):
             self.library_service.move_series_to_group(series_id, target_code)
         self.reload_library()
 
+    def on_folder_dropped(self, folder_path: Path) -> None:
+        """处理拖放导入的文件夹"""
+        # 创建一个简化的导入对话框，只需要输入作者和标签
+        dialog = QDialog(self)
+        dialog.setWindowTitle("快速导入")
+        dialog.resize(400, 200)
+        
+        layout = QVBoxLayout(dialog)
+        
+        folder_label = QLabel(f"导入目录: {folder_path.name}")
+        
+        author_edit = QLineEdit()
+        author_edit.setPlaceholderText("可选")
+        author_edit.setToolTip("漫画作者")
+        
+        tags_edit = QLineEdit()
+        tags_edit.setPlaceholderText("可选")
+        tags_edit.setToolTip("漫画标签，多个标签用空格分隔")
+        
+        form = QFormLayout()
+        form.addRow("导入目录", folder_label)
+        form.addRow("作者(可选)", author_edit)
+        form.addRow("标签(可选)", tags_edit)
+        
+        layout.addLayout(form)
+        
+        hint = QLabel("提示：漫画名称和集数将自动识别")
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # 执行导入
+        try:
+            self._set_import_controls_enabled(False)
+            self.statusBar().showMessage("导入中...", 0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            results = self.import_service.import_auto_folder(
+                folder_path,
+                author=author_edit.text().strip(),
+                tags=tags_edit.text().strip(),
+                hash_check=self.hash_check,
+                duplicate_policy=self.duplicate_policy,
+                custom_name="",
+                progress_callback=lambda d, t: (self.statusBar().showMessage(f"导入中... {d}/{t}", 0), QApplication.processEvents()),
+            )
+            self.reload_library()
+            
+            imported_count = sum(1 for r in results if r.imported)
+            failed_count = sum(1 for r in results if not r.imported)
+            
+            # 如果有失败的导入，生成错误日志
+            if failed_count > 0:
+                log_file = self.import_service.generate_error_log(results, folder_path)
+                message = f"导入完成：成功 {imported_count} 集，跳过/失败 {failed_count} 集"
+                if log_file:
+                    message += f"\n\n错误日志已生成：\n{log_file}"
+                    QMessageBox.information(self, "导入完成", message)
+                self.statusBar().showMessage(message, 5000)
+            else:
+                self.statusBar().showMessage(f"导入完成：成功 {imported_count} 集", 3500)
+        except Exception as exc:
+            self._show_error("导入失败", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._set_import_controls_enabled(True)
+
     def toggle_selected_favorite(self) -> None:
         item = self.series_list.currentItem()
         if item is None:
@@ -886,24 +1327,39 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
 
+        self._sync_category_state_from_row(row)
+        self.reload_library()
+
+    def _sync_category_state_from_row(self, row: int) -> None:
         if row == 0:
             self.current_category = "all"
             self.current_custom_group_id = None
-        elif row == 1:
+            return
+        if row == 1:
             self.current_category = "favorite"
             self.current_custom_group_id = None
-        elif row == 2:
+            return
+        if row == 2:
             self.current_category = "unread"
             self.current_custom_group_id = None
-        elif row == 3:
+            return
+        if row == 3:
             self.current_category = "read"
             self.current_custom_group_id = None
-        else:
-            item = self.category_list.item(row)
-            group_id = item.data(Qt.ItemDataRole.UserRole)
-            self.current_category = "group"
-            self.current_custom_group_id = int(group_id)
-        self.reload_library()
+            return
+
+        item = self.category_list.item(row)
+        if item is None:
+            self.current_category = "all"
+            self.current_custom_group_id = None
+            return
+        group_id = item.data(Qt.ItemDataRole.UserRole)
+        if group_id is None:
+            self.current_category = "all"
+            self.current_custom_group_id = None
+            return
+        self.current_category = "group"
+        self.current_custom_group_id = int(group_id)
 
     def add_group(self) -> None:
         name, ok = QInputDialog.getText(self, "新建分组", "分组名")
@@ -1012,4 +1468,5 @@ class MainWindow(QMainWindow):
                 selected_row = idx
 
         self.category_list.setCurrentRow(selected_row)
+        self._sync_category_state_from_row(selected_row)
         self.category_list.blockSignals(False)

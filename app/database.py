@@ -39,8 +39,10 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 series_id INTEGER NOT NULL,
                 episode_number INTEGER NOT NULL,
+                episode_name TEXT NOT NULL DEFAULT '',
+                episode_order INTEGER NOT NULL DEFAULT 0,
                 folder_path TEXT NOT NULL,
-                storage_mode TEXT NOT NULL DEFAULT 'reference',
+                storage_mode TEXT NOT NULL DEFAULT 'copy',
                 data_path TEXT,
                 image_count INTEGER NOT NULL DEFAULT 0,
                 is_read INTEGER NOT NULL DEFAULT 0,
@@ -108,7 +110,51 @@ class Database:
             ON bookmarks(series_id);
             """
         )
+        self._ensure_episode_columns()
         self.conn.commit()
+
+    def _ensure_episode_columns(self) -> None:
+        cols = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(episodes)").fetchall()
+        }
+
+        if "episode_name" not in cols:
+            self.conn.execute(
+                "ALTER TABLE episodes ADD COLUMN episode_name TEXT NOT NULL DEFAULT ''"
+            )
+        if "episode_order" not in cols:
+            self.conn.execute(
+                "ALTER TABLE episodes ADD COLUMN episode_order INTEGER NOT NULL DEFAULT 0"
+            )
+
+        self.conn.execute(
+            """
+            UPDATE episodes
+            SET episode_name = printf('第%d集', episode_number)
+            WHERE TRIM(COALESCE(episode_name, '')) = ''
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE episodes
+            SET episode_order = episode_number
+            WHERE COALESCE(episode_order, 0) <= 0
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE episodes
+            SET storage_mode = 'copy'
+            WHERE TRIM(LOWER(COALESCE(storage_mode, ''))) != 'copy'
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episodes_series_order
+            ON episodes(series_id, episode_order, id)
+            """
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

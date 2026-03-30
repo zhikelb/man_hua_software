@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
 
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, QTimer, Qt
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtGui import QKeyEvent, QKeySequence, QPixmap
+from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeyEvent, QKeySequence, QPixmap, QShowEvent
+from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -15,6 +19,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -22,7 +27,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.services.library_service import LibraryService
 from app.services.reader_service import ReaderService
+from app.utils.cover_generator import store_cover_image
+
+if TYPE_CHECKING:
+    from PyQt6.QtCore import QObject
 
 
 _KEY_NAME_TO_QT: dict[str, Qt.Key] = {
@@ -42,21 +52,26 @@ _KEY_NAME_TO_QT: dict[str, Qt.Key] = {
 
 class ReaderWindow(QWidget):
     progress_changed = pyqtSignal(int)
+    cover_changed = pyqtSignal(int)
 
     def __init__(
         self,
         reader_service: ReaderService,
+        library_service: LibraryService,
         series_id: int,
         series_name: str,
         reader_config: dict[str, Any],
     ) -> None:
         super().__init__()
         self.reader_service = reader_service
+        self.library_service = library_service
         self.series_id = series_id
         self.series_name = series_name
         self.reader_config = reader_config
         self.current_pixmap = QPixmap()
         self._finished_prompt_shown = False
+        self._scaled_cache: OrderedDict[tuple[int, str, int, int], QPixmap] = OrderedDict()
+        self._scaled_cache_limit = 8
 
         key_cfg = self.reader_config.get("key_bindings", {})
         hide_names = [str(k) for k in key_cfg.get("hide_window", ["Escape"])]
@@ -122,9 +137,22 @@ class ReaderWindow(QWidget):
         jump_btn = QPushButton("跳转...")
         jump_btn.clicked.connect(self.show_jump_dialog)
         top.addWidget(jump_btn)
+
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("高质量", "high")
+        self.render_mode_combo.addItem("性能模式", "performance")
+        default_render_mode = str(self.reader_config.get("render_mode", "high")).strip().lower()
+        render_idx = self.render_mode_combo.findData(default_render_mode)
+        if render_idx < 0:
+            render_idx = self.render_mode_combo.findData("high")
+        if render_idx >= 0:
+            self.render_mode_combo.setCurrentIndex(render_idx)
+        self.render_mode_combo.currentIndexChanged.connect(self._on_render_mode_changed)
         
         top.addWidget(QLabel("缩放"))
         top.addWidget(self.zoom_combo)
+        top.addWidget(QLabel("渲染"))
+        top.addWidget(self.render_mode_combo)
         root.addLayout(top)
 
         self.image_label = QLabel()
@@ -135,13 +163,33 @@ class ReaderWindow(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.image_label)
         self.scroll.viewport().installEventFilter(self)
+
         root.addWidget(self.scroll)
+
+        self.prev_button = QPushButton("◀", self.scroll.viewport())
+        self.prev_button.setToolTip("上一页")
+        self.prev_button.setFixedSize(44, 80)
+        self.prev_button.setStyleSheet("background-color: rgba(30, 30, 30, 120); color: white; border-radius: 6px;")
+        self.prev_button.clicked.connect(self._go_previous)
+
+        self.next_button = QPushButton("▶", self.scroll.viewport())
+        self.next_button.setToolTip("下一页")
+        self.next_button.setFixedSize(44, 80)
+        self.next_button.setStyleSheet("background-color: rgba(30, 30, 30, 120); color: white; border-radius: 6px;")
+        self.next_button.clicked.connect(self._go_next)
 
         pix, text = self.reader_service.open_series(series_id)
         self.current_pixmap = pix
         self.position_label.setText(text)
         self.refresh_view()
+        self._relayout_page_buttons()
+        QTimer.singleShot(0, self._on_first_layout_ready)
         self.setFocus()
+
+    def _on_first_layout_ready(self) -> None:
+        self._relayout_page_buttons()
+        self._scaled_cache.clear()
+        self.refresh_view()
 
     def _parse_shortcut_list(self, names: list[str]) -> set[str]:
         shortcuts: set[str] = set()
@@ -177,11 +225,11 @@ class ReaderWindow(QWidget):
     def _sync_current_view(self) -> None:
         pix, text = self.reader_service.get_current_view()
         self.current_pixmap = pix
+        self._scaled_cache.clear()
         self.position_label.setText(text)
         self.refresh_view()
-        self.progress_changed.emit(self.series_id)
 
-    def eventFilter(self, watched, event) -> bool:
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() == QEvent.Type.Wheel:
             angle = event.angleDelta().y()
             if angle < 0:
@@ -190,16 +238,50 @@ class ReaderWindow(QWidget):
                 self._go_previous()
             return True
 
-        if event.type() == QEvent.Type.MouseButtonPress:
+        if event.type() == QEvent.Type.MouseButtonPress and watched in (self.image_label, self.scroll.viewport()):
             button = event.button()
-            if button == Qt.MouseButton.LeftButton:
-                self._go_next()
-                return True
             if button == Qt.MouseButton.RightButton:
-                self._go_previous()
+                global_pos = event.globalPosition().toPoint()
+                self._show_image_context_menu(global_pos)
                 return True
 
         return super().eventFilter(watched, event)
+
+    def _show_image_context_menu(self, global_pos) -> None:
+        menu = QMenu(self)
+
+        set_cover_action = QAction("添加为漫画封面", self)
+        set_cover_action.triggered.connect(self._set_current_image_as_cover)
+        menu.addAction(set_cover_action)
+
+        open_folder_action = QAction("跳转到文件所在位置", self)
+        open_folder_action.triggered.connect(self._open_current_image_folder)
+        menu.addAction(open_folder_action)
+
+        menu.exec(global_pos)
+
+    def _set_current_image_as_cover(self) -> None:
+        if not self.reader_service.image_rows:
+            return
+        try:
+            row = self.reader_service.image_rows[self.reader_service.current_index]
+            image_path = Path(str(row["file_path"]))
+            if not image_path.exists():
+                raise ValueError("当前图片文件不存在")
+            cover_path = store_cover_image(self.series_id, image_path)
+            self.library_service.update_series_cover(self.series_id, str(cover_path))
+            self.cover_changed.emit(self.series_id)
+            QMessageBox.information(self, "提示", "已设置为漫画封面", QMessageBox.StandardButton.Ok)
+        except Exception as exc:
+            QMessageBox.warning(self, "失败", str(exc), QMessageBox.StandardButton.Ok)
+
+    def _open_current_image_folder(self) -> None:
+        if not self.reader_service.image_rows:
+            return
+        row = self.reader_service.image_rows[self.reader_service.current_index]
+        image_path = Path(str(row["file_path"]))
+        if image_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(image_path.parent)))
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = int(event.key())
@@ -228,26 +310,65 @@ class ReaderWindow(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._relayout_page_buttons()
         self.refresh_view()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._relayout_page_buttons()
+        self._scaled_cache.clear()
+        self.refresh_view()
+
+    def _relayout_page_buttons(self) -> None:
+        viewport = self.scroll.viewport()
+        width = viewport.width()
+        height = viewport.height()
+        button_w = self.prev_button.width()
+        button_h = self.prev_button.height()
+        y = max(8, (height - button_h) // 2)
+        margin = 10
+        self.prev_button.move(margin, y)
+        self.next_button.move(max(margin, width - button_w - margin), y)
+        self.prev_button.raise_()
+        self.next_button.raise_()
 
     def refresh_view(self) -> None:
         if self.current_pixmap.isNull():
             return
 
         zoom_mode = self.zoom_combo.currentData()
+        render_mode = str(self.render_mode_combo.currentData() or "high")
+        viewport_size = self.scroll.viewport().size()
+        cache_key = (
+            int(self.current_pixmap.cacheKey()),
+            str(zoom_mode),
+            render_mode,
+            viewport_size.width(),
+            viewport_size.height(),
+        )
+        cached = self._scaled_cache.get(cache_key)
+        if cached is not None:
+            self.image_label.setPixmap(cached)
+            self._scaled_cache.move_to_end(cache_key)
+            return
+
+        transform_mode = (
+            Qt.TransformationMode.SmoothTransformation
+            if render_mode == "high"
+            else Qt.TransformationMode.FastTransformation
+        )
+
         if zoom_mode == "fill":
-            target = self.scroll.viewport().size()
             scaled = self.current_pixmap.scaled(
-                target,
+                viewport_size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
+                transform_mode,
             )
         elif zoom_mode == "fit":
-            target = self.scroll.viewport().size()
             scaled = self.current_pixmap.scaled(
-                target,
+                viewport_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                transform_mode,
             )
         else:
             factor = int(zoom_mode) / 100.0
@@ -255,17 +376,24 @@ class ReaderWindow(QWidget):
             scaled = self.current_pixmap.scaled(
                 target_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                transform_mode,
             )
 
+        self._scaled_cache[cache_key] = scaled
+        while len(self._scaled_cache) > self._scaled_cache_limit:
+            self._scaled_cache.popitem(last=False)
         self.image_label.setPixmap(scaled)
 
     def _go_next(self) -> None:
         pix, text, finished = self.reader_service.next_image()
         self.current_pixmap = pix
+        self._scaled_cache.clear()
         self.position_label.setText(text)
         self.refresh_view()
-        self.progress_changed.emit(self.series_id)
+
+    def _on_render_mode_changed(self) -> None:
+        self._scaled_cache.clear()
+        self.refresh_view()
         if finished and not self._finished_prompt_shown:
             self._finished_prompt_shown = True
             box = QMessageBox(self)
@@ -278,9 +406,13 @@ class ReaderWindow(QWidget):
     def _go_previous(self) -> None:
         pix, text = self.reader_service.previous_image()
         self.current_pixmap = pix
+        self._scaled_cache.clear()
         self.position_label.setText(text)
         self.refresh_view()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
         self.progress_changed.emit(self.series_id)
+        super().closeEvent(event)
 
     def add_bookmark(self) -> None:
         """添加书签"""
@@ -303,15 +435,17 @@ class ReaderWindow(QWidget):
         
         ep_spin = QSpinBox()
         ep_spin.setMinimum(1)
-        ep_spin.setMaximum(1000)
-        ep_spin.setValue(1)
+        max_order = max((int(row.get("episode_order", 1)) for row in self.reader_service.image_rows), default=1)
+        ep_spin.setMaximum(max(max_order, 1))
+        current_order = int(self.reader_service.image_rows[self.reader_service.current_index].get("episode_order", 1))
+        ep_spin.setValue(current_order)
         
         page_spin = QSpinBox()
         page_spin.setMinimum(1)
         page_spin.setMaximum(1000)
         page_spin.setValue(1)
         
-        form.addRow("集数", ep_spin)
+        form.addRow("顺序", ep_spin)
         form.addRow("页码", page_spin)
         layout.addLayout(form)
         
@@ -326,9 +460,9 @@ class ReaderWindow(QWidget):
             return
         
         try:
-            episode = ep_spin.value()
+            episode_order = ep_spin.value()
             page = page_spin.value()
-            if self.reader_service.jump_to_position(episode, page):
+            if self.reader_service.jump_to_position(episode_order, page):
                 self._sync_current_view()
             else:
                 QMessageBox.warning(self, "跳转失败", "该位置不存在", QMessageBox.StandardButton.Ok)

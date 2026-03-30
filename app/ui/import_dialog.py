@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -14,6 +15,11 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QVBoxLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QSpinBox,
+    QScrollArea,
+    QWidget,
 )
 
 from app.utils.image_files import list_images_sorted
@@ -30,6 +36,14 @@ class AutoImportRequest:
     author: str
     tags: str
     custom_name: str = ""
+
+
+@dataclass
+class EpisodeImportInfo:
+    """多集导入的集数信息"""
+    folder_name: str
+    guessed_number: int | None
+    image_count: int
 
 
 def _guess_name_and_episode(folder_name: str) -> tuple[str, int | None]:
@@ -53,8 +67,10 @@ class ImportDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("导入漫画")
-        self.resize(540, 260)
+        self.resize(700, 600)
         self.selected_folder: Path | None = None
+        self.episode_spins: dict[int, QSpinBox] = {}  # row -> QSpinBox
+        self.episode_infos: list[EpisodeImportInfo] = []
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -89,7 +105,19 @@ class ImportDialog(QDialog):
         form.addRow("作者(可选)", self.author_edit)
         form.addRow("标签(可选)", self.tags_edit)
 
-        hint = QLabel("说明：软件会自动判断是单集导入还是多集导入，并自动识别漫画名与集数。")
+        # 多集导入时的集数详细信息表
+        self.episode_table_label = QLabel("各集详细信息（多集导入时）：")
+        self.episode_table_label.setVisible(False)
+        root.addWidget(self.episode_table_label)
+        
+        self.episode_table = QTableWidget()
+        self.episode_table.setColumnCount(3)
+        self.episode_table.setHorizontalHeaderLabels(["文件夹名", "自动识别集数", "修改集数"])
+        self.episode_table.setVisible(False)
+        self.episode_table.setMaximumHeight(250)
+        root.addWidget(self.episode_table)
+
+        hint = QLabel("说明：软件会自动判断是单集导入还是多集导入，并自动识别漫画名与集数。多集导入时可在下方表格修改各集的集数。")
         hint.setWordWrap(True)
         root.addWidget(hint)
 
@@ -113,6 +141,7 @@ class ImportDialog(QDialog):
     def _apply_auto_detect(self, folder: Path) -> None:
         direct_images = list_images_sorted(folder)
         child_folders = [p for p in folder.iterdir() if p.is_dir()]
+        child_folders.sort(key=lambda p: p.name)
         child_episode_folders = [p for p in child_folders if list_images_sorted(p)]
 
         if direct_images and not child_episode_folders:
@@ -122,15 +151,37 @@ class ImportDialog(QDialog):
             self.name_edit.setText(guessed_name)
             self.detected_episode_label.setText(str(guessed_episode or 1))
             self.image_count_label.setText(f"{len(direct_images)} 张")
+            self.episode_table.setVisible(False)
+            self.episode_table_label.setVisible(False)
             return
 
         if child_episode_folders:
             self.detected_type_label.setText("多集导入")
             self.detected_name_label.setText(folder.name)
             self.name_edit.setText(folder.name)
+            
+            # 分析每一集的信息
+            self.episode_infos = []
+            total_images = 0
+            for ep_folder in child_episode_folders:
+                images = list_images_sorted(ep_folder)
+                _, guessed_ep_num = _guess_name_and_episode(ep_folder.name)
+                self.episode_infos.append(
+                    EpisodeImportInfo(
+                        folder_name=ep_folder.name,
+                        guessed_number=guessed_ep_num,
+                        image_count=len(images),
+                    )
+                )
+                total_images += len(images)
+            
             self.detected_episode_label.setText(f"共 {len(child_episode_folders)} 集")
-            total_images = sum(len(list_images_sorted(p)) for p in child_episode_folders)
             self.image_count_label.setText(f"{total_images} 张")
+            
+            # 构建集数详细信息表
+            self._populate_episode_table()
+            self.episode_table.setVisible(True)
+            self.episode_table_label.setVisible(True)
             return
 
         self.detected_type_label.setText("未识别")
@@ -138,6 +189,46 @@ class ImportDialog(QDialog):
         self.name_edit.clear()
         self.detected_episode_label.setText("-")
         self.image_count_label.setText("0 张")
+        self.episode_table.setVisible(False)
+        self.episode_table_label.setVisible(False)
+
+    def _populate_episode_table(self) -> None:
+        """填充集数信息表"""
+        self.episode_table.setRowCount(0)
+        self.episode_spins.clear()
+        
+        for idx, ep_info in enumerate(self.episode_infos):
+            self.episode_table.insertRow(idx)
+            
+            # 文件夹名
+            folder_item = QTableWidgetItem(ep_info.folder_name)
+            folder_item.setFlags(folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.episode_table.setItem(idx, 0, folder_item)
+            
+            # 自动识别的集数
+            guessed_num = ep_info.guessed_number or (idx + 1)
+            guessed_item = QTableWidgetItem(str(guessed_num))
+            guessed_item.setFlags(guessed_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.episode_table.setItem(idx, 1, guessed_item)
+            
+            # 集数修改输入框
+            spin = QSpinBox()
+            spin.setMinimum(1)
+            spin.setMaximum(999)
+            spin.setValue(guessed_num)
+            self.episode_table.setCellWidget(idx, 2, spin)
+            self.episode_spins[idx] = spin
+
+    def get_episode_numbers(self) -> list[int]:
+        """获取用户修改后的各集集数"""
+        if not self.episode_spins:
+            return []
+        
+        result = []
+        for idx in sorted(self.episode_spins.keys()):
+            spin = self.episode_spins[idx]
+            result.append(spin.value())
+        return result
 
     def accept_with_validate(self) -> None:
         if self.selected_folder is None:
@@ -146,6 +237,14 @@ class ImportDialog(QDialog):
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "提示", "请输入漫画名称")
             return
+        
+        # 检查多集导入时的集数是否有重复
+        if self.episode_spins:
+            ep_numbers = self.get_episode_numbers()
+            if len(ep_numbers) != len(set(ep_numbers)):
+                QMessageBox.warning(self, "提示", "各集的集数不能重复，请修改")
+                return
+        
         self.accept()
 
     def build_request(self) -> AutoImportRequest:

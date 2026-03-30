@@ -4,17 +4,18 @@ import shutil
 import sqlite3
 import re
 import hashlib
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from app.config import IMPORT_COPY_ROOT
 from app.database import Database
 from app.utils.cover_generator import render_name_author_cover, store_cover_image
 from app.utils.image_files import file_sha1, list_images_sorted, natural_sort_key
 
-StorageMode = Literal["reference", "copy"]
+StorageMode = Literal["copy"]
 CoverSource = Literal["none", "first_image", "custom_image", "name_author"]
 DuplicatePolicy = Literal["error", "skip", "allow"]
 _EPISODE_PATTERN = re.compile(
@@ -28,8 +29,9 @@ class ImportMetadata:
     name: str
     author: str
     episode_number: int
+    episode_name: str
+    episode_order: int
     tags: str
-    storage_mode: StorageMode
     cover_source: CoverSource
     custom_cover_path: str | None = None
 
@@ -49,7 +51,6 @@ class BatchImportRequest:
     author: str
     start_episode: int
     tags: str
-    storage_mode: StorageMode
     cover_source: CoverSource
     hash_check: bool
     duplicate_policy: DuplicatePolicy
@@ -101,10 +102,50 @@ class ImportService:
                         raise ValueError(msg)
 
             episode_id = self._create_episode(conn, folder, metadata, series_id, len(images))
-            self._insert_images(conn, episode_id, images, metadata.storage_mode, incoming_hashes)
+            self._insert_images(conn, episode_id, images, incoming_hashes)
             self._update_cover(conn, series_id, episode_id, metadata, images)
 
         return ImportResult(True, series_id, metadata.episode_number, "导入成功")
+
+    def import_backup_data(
+        self,
+        source: Path,
+        hash_check: bool,
+        duplicate_policy: DuplicatePolicy = "skip",
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[ImportResult]:
+        if not source.exists():
+            raise ValueError("备份路径不存在")
+
+        if source.is_file() and source.suffix.lower() == ".zip":
+            import zipfile
+
+            with tempfile.TemporaryDirectory(prefix="manga_backup_import_") as tmp:
+                temp_root = Path(tmp)
+                with zipfile.ZipFile(source, "r") as zf:
+                    zf.extractall(temp_root)
+                backup_data_dir = self._find_backup_data_dir(temp_root)
+                if backup_data_dir is None:
+                    raise ValueError("无法识别备份包结构，未找到 data/manga.db 与 data/imports")
+                return self._import_from_backup_data_dir(
+                    backup_data_dir=backup_data_dir,
+                    hash_check=hash_check,
+                    duplicate_policy=duplicate_policy,
+                    progress_callback=progress_callback,
+                )
+
+        if source.is_dir():
+            backup_data_dir = self._find_backup_data_dir(source)
+            if backup_data_dir is None:
+                raise ValueError("无法识别备份目录结构，未找到 data/manga.db 与 data/imports")
+            return self._import_from_backup_data_dir(
+                backup_data_dir=backup_data_dir,
+                hash_check=hash_check,
+                duplicate_policy=duplicate_policy,
+                progress_callback=progress_callback,
+            )
+
+        raise ValueError("仅支持zip备份文件或备份目录")
 
     def import_auto_folder(
         self,
@@ -114,9 +155,19 @@ class ImportService:
         hash_check: bool,
         duplicate_policy: DuplicatePolicy = "skip",
         custom_name: str = "",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[ImportResult]:
         if not folder.exists() or not folder.is_dir():
             raise ValueError("导入路径不存在或不是文件夹")
+
+        backup_data_dir = self._resolve_backup_data_dir(folder)
+        if backup_data_dir is not None:
+            return self._import_from_backup_data_dir(
+                backup_data_dir=backup_data_dir,
+                hash_check=hash_check,
+                duplicate_policy=duplicate_policy,
+                progress_callback=progress_callback,
+            )
 
         direct_images = list_images_sorted(folder)
         child_folders = [p for p in folder.iterdir() if p.is_dir()]
@@ -130,35 +181,39 @@ class ImportService:
                 name=name,
                 author=author.strip(),
                 episode_number=guessed_episode or 1,
+                episode_name=folder.name,
+                episode_order=1,
                 tags=tags.strip(),
-                storage_mode="copy",
                 cover_source="first_image",
             )
-            return [
-                self.import_folder(
+            single_result = self.import_folder(
                     folder=folder,
                     metadata=metadata,
                     hash_check=hash_check,
                     duplicate_policy=duplicate_policy,
                 )
-            ]
+            if progress_callback is not None:
+                progress_callback(1, 1)
+            return [single_result]
 
         if episode_folders:
             series_name = custom_name or self._guess_series_name_for_batch(folder.name)
             results: list[ImportResult] = []
-            fallback_episode = 1
+            start_episode_number, start_episode_order = self._get_series_start_values(
+                series_name,
+                author.strip(),
+            )
 
-            for ep_folder in episode_folders:
-                _, guessed_episode = self._guess_name_and_episode(ep_folder.name)
-                episode_number = guessed_episode or fallback_episode
-                fallback_episode = max(fallback_episode + 1, episode_number + 1)
+            for idx, ep_folder in enumerate(episode_folders, start=1):
+                episode_number = start_episode_number + idx - 1
 
                 metadata = ImportMetadata(
                     name=series_name,
                     author=author.strip(),
                     episode_number=episode_number,
+                    episode_name=ep_folder.name,
+                    episode_order=start_episode_order + idx - 1,
                     tags=tags.strip(),
-                    storage_mode="copy",
                     cover_source="first_image",
                 )
 
@@ -173,6 +228,9 @@ class ImportService:
                     )
                 except Exception as exc:
                     results.append(ImportResult(False, -1, episode_number, f"{ep_folder.name}: {exc}"))
+                finally:
+                    if progress_callback is not None:
+                        progress_callback(idx, len(episode_folders))
 
             return results
 
@@ -193,8 +251,9 @@ class ImportService:
                 name=request.name,
                 author=request.author,
                 episode_number=request.start_episode + idx,
+                episode_name=folder.name,
+                episode_order=idx + 1,
                 tags=request.tags,
-                storage_mode=request.storage_mode,
                 cover_source=request.cover_source,
             )
             try:
@@ -283,6 +342,29 @@ class ImportService:
         )
         return int(cur.lastrowid)
 
+    def _get_series_start_values(self, name: str, author: str) -> tuple[int, int]:
+        row = self.db.conn.execute(
+            "SELECT id FROM series WHERE name = ? AND author = ?",
+            (name.strip(), author.strip()),
+        ).fetchone()
+        if row is None:
+            return 1, 1
+
+        series_id = int(row["id"])
+        max_row = self.db.conn.execute(
+            """
+            SELECT
+                COALESCE(MAX(episode_number), 0) AS max_episode_number,
+                COALESCE(MAX(episode_order), 0) AS max_episode_order
+            FROM episodes
+            WHERE series_id = ?
+            """,
+            (series_id,),
+        ).fetchone()
+        if max_row is None:
+            return 1, 1
+        return int(max_row["max_episode_number"]) + 1, int(max_row["max_episode_order"]) + 1
+
     def _update_total_episodes(self, conn: sqlite3.Connection, series_id: int, episode_number: int) -> None:
         conn.execute(
             """
@@ -311,10 +393,22 @@ class ImportService:
 
         cur = conn.execute(
             """
-            INSERT INTO episodes(series_id, episode_number, folder_path, storage_mode, data_path, image_count)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT INTO episodes(
+                series_id, episode_number, episode_name, episode_order,
+                folder_path, storage_mode, data_path, image_count
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (series_id, metadata.episode_number, str(folder), "copy", data_path, image_count),
+            (
+                series_id,
+                metadata.episode_number,
+                metadata.episode_name.strip() or f"第{metadata.episode_number}集",
+                metadata.episode_order,
+                str(folder),
+                "copy",
+                data_path,
+                image_count,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -329,7 +423,6 @@ class ImportService:
         conn: sqlite3.Connection,
         episode_id: int,
         images: list[Path],
-        storage_mode: StorageMode,
         incoming_hashes: list[str] | None,
     ) -> None:
         episode_data_path: Path | None = None
@@ -337,21 +430,222 @@ class ImportService:
         if row and row[0]:
             episode_data_path = Path(str(row[0]))
 
-        for idx, src in enumerate(images):
+        pad_width = max(3, len(str(len(images))))
+
+        for idx, src in enumerate(images, start=1):
+            new_file_name = f"{idx:0{pad_width}d}{src.suffix.lower()}"
             if episode_data_path is not None:
-                dst = episode_data_path / src.name
+                dst = episode_data_path / new_file_name
                 shutil.copy2(src, dst)
                 resolved_path = dst
+                stored_name = new_file_name
             else:
                 resolved_path = src
+                stored_name = src.name
 
-            file_hash = incoming_hashes[idx] if incoming_hashes is not None else None
+            file_hash = incoming_hashes[idx - 1] if incoming_hashes is not None else None
             conn.execute(
                 """
                 INSERT INTO images(episode_id, file_name, file_path, file_hash, sort_order)
                 VALUES(?, ?, ?, ?, ?)
                 """,
-                (episode_id, src.name, str(resolved_path), file_hash, idx),
+                (episode_id, stored_name, str(resolved_path), file_hash, idx - 1),
+            )
+
+    def _resolve_backup_data_dir(self, folder: Path) -> Path | None:
+        candidates = [folder, folder / "data"]
+        for candidate in candidates:
+            if (candidate / "manga.db").exists() and (candidate / "imports").exists():
+                return candidate
+        return None
+
+    def _find_backup_data_dir(self, root: Path) -> Path | None:
+        direct = self._resolve_backup_data_dir(root)
+        if direct is not None:
+            return direct
+
+        for db_file in root.rglob("manga.db"):
+            parent = db_file.parent
+            if (parent / "imports").exists() and (parent / "imports").is_dir():
+                return parent
+        return None
+
+    def _import_from_backup_data_dir(
+        self,
+        backup_data_dir: Path,
+        hash_check: bool,
+        duplicate_policy: DuplicatePolicy,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[ImportResult]:
+        backup_db_path = backup_data_dir / "manga.db"
+        source_conn = sqlite3.connect(str(backup_db_path))
+        source_conn.row_factory = sqlite3.Row
+
+        results: list[ImportResult] = []
+        series_rows = source_conn.execute(
+            "SELECT id, name, author, tags, cover_path FROM series ORDER BY id"
+        ).fetchall()
+        series_id_map: dict[int, int] = {}
+
+        total_episodes = int(
+            source_conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+        )
+        done_episodes = 0
+
+        try:
+            for series_row in series_rows:
+                old_series_id = int(series_row["id"])
+                episodes = source_conn.execute(
+                    """
+                    SELECT episode_number, episode_name, episode_order, data_path
+                    FROM episodes
+                    WHERE series_id = ?
+                    ORDER BY episode_order ASC, id ASC
+                    """,
+                    (old_series_id,),
+                ).fetchall()
+
+                for episode_row in episodes:
+                    data_path = str(episode_row["data_path"] or "")
+                    source_dir = self._resolve_backup_episode_dir(backup_data_dir, data_path)
+                    if source_dir is None:
+                        results.append(
+                            ImportResult(
+                                imported=False,
+                                series_id=-1,
+                                episode_number=int(episode_row["episode_number"]),
+                                message=f"备份数据缺失，找不到目录: {data_path}",
+                            )
+                        )
+                        done_episodes += 1
+                        if progress_callback is not None:
+                            progress_callback(done_episodes, max(total_episodes, 1))
+                        continue
+
+                    metadata = ImportMetadata(
+                        name=str(series_row["name"]),
+                        author=str(series_row["author"] or ""),
+                        episode_number=int(episode_row["episode_number"]),
+                        episode_name=str(episode_row["episode_name"] or ""),
+                        episode_order=int(episode_row["episode_order"]),
+                        tags=str(series_row["tags"] or ""),
+                        cover_source="none",
+                    )
+
+                    try:
+                        result = self.import_folder(
+                            folder=source_dir,
+                            metadata=metadata,
+                            hash_check=hash_check,
+                            duplicate_policy=duplicate_policy,
+                        )
+                        results.append(result)
+                        series_id_map.setdefault(old_series_id, int(result.series_id))
+                    except Exception as exc:
+                        results.append(
+                            ImportResult(
+                                imported=False,
+                                series_id=-1,
+                                episode_number=int(episode_row["episode_number"]),
+                                message=f"{metadata.name}-{metadata.episode_name}: {exc}",
+                            )
+                        )
+                    finally:
+                        done_episodes += 1
+                        if progress_callback is not None:
+                            progress_callback(done_episodes, max(total_episodes, 1))
+
+            for series_row in series_rows:
+                old_series_id = int(series_row["id"])
+                new_series_id = series_id_map.get(old_series_id)
+                if new_series_id is None:
+                    continue
+                self._restore_backup_cover(
+                    backup_data_dir,
+                    new_series_id,
+                    str(series_row["cover_path"] or ""),
+                )
+            if progress_callback is not None and total_episodes == 0:
+                progress_callback(1, 1)
+        finally:
+            source_conn.close()
+
+        if not results:
+            raise ValueError("备份包中未找到可导入的漫画内容")
+        return results
+
+    def _resolve_backup_episode_dir(self, backup_data_dir: Path, data_path: str) -> Path | None:
+        if not data_path:
+            return None
+
+        raw_path = Path(data_path)
+        if raw_path.exists() and raw_path.is_dir():
+            return raw_path
+
+        imports_root = backup_data_dir / "imports"
+        by_name = imports_root / raw_path.name
+        if by_name.exists() and by_name.is_dir():
+            return by_name
+
+        parts = [part for part in raw_path.parts if part and part not in (".", "..")]
+        if "imports" in parts:
+            idx = parts.index("imports")
+            tail = parts[idx + 1 :]
+            if tail:
+                by_tail = imports_root.joinpath(*tail)
+                if by_tail.exists() and by_tail.is_dir():
+                    return by_tail
+
+        return None
+
+    def _restore_backup_cover(self, backup_data_dir: Path, series_id: int, cover_path: str) -> None:
+        if not cover_path:
+            self._set_series_cover_from_first_image(series_id)
+            return
+        candidate = backup_data_dir / "covers" / Path(cover_path).name
+        if candidate.exists():
+            new_cover = store_cover_image(series_id, candidate)
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(new_cover), series_id),
+                )
+            return
+        mapped = self._resolve_backup_episode_dir(backup_data_dir, cover_path)
+        if mapped is not None:
+            images = list_images_sorted(mapped)
+            if images:
+                new_cover = store_cover_image(series_id, images[0])
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (str(new_cover), series_id),
+                    )
+                return
+        self._set_series_cover_from_first_image(series_id)
+
+    def _set_series_cover_from_first_image(self, series_id: int) -> None:
+        row = self.db.conn.execute(
+            """
+            SELECT img.file_path
+            FROM episodes ep
+            JOIN images img ON img.episode_id = ep.id
+            WHERE ep.series_id = ?
+            ORDER BY ep.episode_order ASC, ep.id ASC, img.sort_order ASC
+            LIMIT 1
+            """,
+            (series_id,),
+        ).fetchone()
+        if row is None:
+            return
+        path = Path(str(row["file_path"]))
+        if not path.exists():
+            return
+        new_cover = store_cover_image(series_id, path)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (str(new_cover), series_id),
             )
 
     def _update_cover(
@@ -372,7 +666,8 @@ class ImportService:
                 "SELECT file_path FROM images WHERE episode_id = ? ORDER BY sort_order ASC LIMIT 1",
                 (episode_id,),
             ).fetchone()
-            cover_path = str(row[0]) if row else str(images[0])
+            source_cover = Path(str(row[0])) if row and row[0] else images[0]
+            cover_path = str(store_cover_image(series_id, source_cover))
         elif metadata.cover_source == "name_author":
             cover_path = str(render_name_author_cover(series_id, metadata.name, metadata.author))
         else:
@@ -383,3 +678,38 @@ class ImportService:
                 "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (cover_path, series_id),
             )
+
+    def generate_error_log(self, results: list[ImportResult], output_dir: Path | None = None) -> Path | None:
+        """生成导入错误日志
+        
+        Args:
+            results: 导入结果列表
+            output_dir: 输出目录，如果为None则使用导入根目录
+        
+        Returns:
+            日志文件路径，如果没有错误则返回None
+        """
+        # 收集失败的导入
+        failed_results = [r for r in results if not r.imported]
+        if not failed_results:
+            return None
+        
+        # 确定输出目录
+        if output_dir is None:
+            output_dir = IMPORT_COPY_ROOT
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 生成日志文件
+        log_file = output_dir / f"error_{int(time.time())}.log"
+        
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("漫画导入错误日志\n")
+            f.write("=" * 60 + "\n\n")
+            
+            for result in failed_results:
+                f.write(f"集数: {result.episode_number}\n")
+                f.write(f"漫画ID: {result.series_id}\n")
+                f.write(f"错误信息: {result.message}\n")
+                f.write("-" * 60 + "\n")
+        
+        return log_file

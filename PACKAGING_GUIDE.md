@@ -2,13 +2,13 @@
 
 ## 📦 打包完成！
 
-当前版本仅提供便携文件夹分发方案（推荐且唯一默认方案）。
+当前版本推荐便携文件夹分发方案。
 
 ## 当前分发方案
 
 | 方案 | 文件位置 | 特点 | 用途 |
 |------|--------|------|------|
-| **便携文件夹** | `dist/漫画阅读器_便携版/` | 含运行所需组件，无需安装 | 默认分发 |
+| **便携文件夹** | `dist_portable/` | 含运行所需组件，无需安装 | 默认分发 |
 
 ---
 
@@ -25,14 +25,15 @@
 ```
 dist_portable/
 ├── 漫画阅读器.exe          ← 主程序
-├── 启动应用.bat             ← 双击运行
+├── start_app.bat           ← 启动器（推荐）
+├── 启动应用.bat             ← 启动器（中文别名）
 ├── data/                   ← 应用数据（自动创建）
 └── README.md               ← 使用说明
 ```
 
 **启动步骤：**
 1. 解压 `dist_portable` 文件夹到任意位置
-2. 双击 `启动应用.bat` 启动应用
+2. 双击 `start_app.bat`（或 `启动应用.bat`）启动应用
 3. 首次运行会自动创建数据目录
 
 ### ⚙️ 配置数据目录
@@ -51,6 +52,7 @@ dist_portable/
 ```
 
 输出目录：`dist/漫画阅读器_便携版/`
+输出目录：`dist_portable/`
 
 ---
 
@@ -128,10 +130,9 @@ Copy-Item -Path "data" -Destination "backup_data" -Recurse
 1. 修改源代码
 2. 重新运行打包命令：
    ```powershell
-   rm -r dist build dist_portable
-   venv\Scripts\pyinstaller build_exe.spec --distpath dist --workpath build --clean
+  .\build_portable.ps1
    ```
-3. 分发新的 `dist/漫画阅读器_便携版` 文件夹
+3. 分发新的 `dist_portable` 文件夹
 
 ### 清理临时文件
 ```powershell
@@ -145,7 +146,7 @@ Remove-Item -Path "dist" -Recurse -Force
 
 ```powershell
 # 1. 安装打包工具
-venv\Scripts\pip install pyinstaller
+.venv\Scripts\pip install pyinstaller
 
 # 2. 一键生成便携文件夹
 ./build_portable.ps1

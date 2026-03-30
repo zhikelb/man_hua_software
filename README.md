@@ -15,23 +15,23 @@
 ## 🚀 快速开始
 
 ### 方案 A: 使用便携版本（推荐 ⭐）
-```bash
-# 直接运行，无需任何安装
-dist_portable/启动应用.bat
+```powershell
+# 直接运行，无需安装
+dist_portable\start_app.bat
 ```
 
 ### 方案 B: 直接运行 EXE
-```bash
-dist/漫画阅读器.exe
+```powershell
+dist\漫画阅读器_便携版\漫画阅读器.exe
 ```
 
 ### 方案 C: 开发环境运行
 ```powershell
 # 1. 安装依赖
-venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # 2. 启动应用
-venv\Scripts\python.exe run.py
+.venv\Scripts\python.exe run.py
 ```
 
 ---
@@ -41,8 +41,7 @@ venv\Scripts\python.exe run.py
 ### 📥 智能导入
 - ✅ 单层文件夹导入（按文件名自然排序）
 - ✅ 批量导入（按父目录子文件夹映射集数）
-- ✅ 索引导入（记录原路径，节省空间）
-- ✅ 全量导入（复制到数据目录，离线可用）
+- ✅ copy 导入（复制到数据目录，离线可用）
 - ✅ 智能去重（哈希比对，三种处理策略）
 
 ### 📚 完整管理
@@ -56,10 +55,18 @@ venv\Scripts\python.exe run.py
 ### 👁️ 专业阅读器
 - ✅ 双击封面进入阅读模式
 - ✅ 自动恢复上次阅读位置
-- ✅ 流畅翻页（左右方向键）
+- ✅ 流畅翻页（键盘、滚轮、阅读区左右按钮）
 - ✅ 集末自动跳转下一集
 - ✅ 多档位缩放与自适应窗口
+- ✅ 高质量 / 性能模式切换
 - ✅ 书签管理（添加、查看、跳转、删除）
+- ✅ 图片右键菜单（添加为漫画封面、跳转到文件所在位置）
+
+### 📤 导入导出与备份
+- ✅ 备份所有数据（Zip）
+- ✅ 导入备份数据（支持 zip 或目录，自动合并并输出错误报告）
+- ✅ 导出当前漫画（支持多选漫画或按分组导出）
+- ✅ 导出目录结构：漫画名 / 集名 / 图片内部名
 
 ### 💾 数据持久化
 - ✅ SQLite 本地数据库
@@ -82,13 +89,13 @@ venv\Scripts\python.exe run.py
 #### 方式 1: 便携版本（无需安装）✨ 推荐
 ```
 1. 下载 dist_portable 文件夹
-2. 双击 启动应用.bat
+2. 双击 start_app.bat（或 启动应用.bat）
 3. 完成！
 ```
 
 #### 方式 2: 独立 EXE
 ```
-1. 在 dist 目录找到 漫画阅读器.exe
+1. 在 dist/漫画阅读器_便携版 目录找到 漫画阅读器.exe
 2. 右键 → 创建快捷方式
 3. 双击快捷方式运行
 ```
@@ -110,6 +117,7 @@ python run.py
 .\build_portable.ps1
 ```
 输出目录：`dist_portable/`
+同步构建目录：`dist/漫画阅读器_便携版/`
 
 ---
 
@@ -136,8 +144,8 @@ man_hua_software/
 ├── data/                        # 应用数据
 │   ├── manga.db                # SQLite 数据库
 │   ├── config.json             # 应用配置
-│   ├── covers/                 # 动态生成的封面
-│   └── imports/                # 全量导入文件
+│   ├── covers/                 # 动态生成/存储的封面
+│   └── imports/                # 导入后的漫画图片
 ├── dist/                        # 编译输出（EXE）
 ├── dist_portable/              # 便携版本 ⭐
 │   ├── 漫画阅读器.exe
@@ -217,7 +225,7 @@ CREATE TABLE reading_progress (
 {
     "import": {
         "hash_check_on_duplicate": true,
-        "duplicate_content_policy": "skip"  // skip/error/ignore
+        "duplicate_content_policy": "skip"  // skip/error/allow
     },
     "reader": {
         "preload_count": 2,
@@ -378,16 +386,18 @@ python run.py
 
 ### 重新打包
 ```powershell
-# 清理旧的构建
-rm -r dist build dist_portable
+# 一键重建便携版（推荐）
+.\build_portable.ps1
+```
 
-# 重新打包
-venv\Scripts\pyinstaller build_exe.spec --distpath dist --workpath build --clean
+### 常用 git 流程
+```powershell
+# 查看改动
+git status
 
-# 创建便携版本
-mkdir dist_portable
-Copy-Item -Path dist\* -Destination dist_portable\
-Copy-Item -Path data -Destination dist_portable\data -Recurse
+# 提交代码
+git add app README.md PACKAGING_GUIDE.md build_portable.ps1
+git commit -m "feat: update portable build and documentation"
 ```
 
 ---

@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from app.database import Database
-from app.config import IMPORT_COPY_ROOT
+from app.config import COVER_ROOT, IMPORT_COPY_ROOT
 
 
 @dataclass
@@ -27,14 +27,14 @@ class LibraryService:
         sql = """
             SELECT s.id, s.name, s.author, s.total_episodes, s.cover_path, s.is_favorite,
                    rp.series_id AS progress_exists,
-                   last_ep.episode_number AS last_read_episode,
-                   max_ep.max_episode AS max_episode
+                   last_ep.episode_order AS last_read_order,
+                   max_ep.max_order AS max_order
             FROM series s
             LEFT JOIN reading_progress rp ON rp.series_id = s.id
             LEFT JOIN episodes e ON e.id = rp.current_episode_id
             LEFT JOIN episodes last_ep ON last_ep.id = rp.current_episode_id
             LEFT JOIN (
-                SELECT series_id, MAX(episode_number) AS max_episode
+                SELECT series_id, MAX(episode_order) AS max_order
                 FROM episodes
                 GROUP BY series_id
             ) max_ep ON max_ep.series_id = s.id
@@ -52,7 +52,7 @@ class LibraryService:
         elif category == "unread":
             sql += " AND rp.series_id IS NULL"
         elif category == "read":
-            sql += " AND rp.series_id IS NOT NULL AND last_read_episode >= max_episode"
+            sql += " AND rp.series_id IS NOT NULL AND last_read_order >= max_order"
 
         # 根据排序选项构建ORDER BY子句
         order_col = "s.updated_at"
@@ -85,6 +85,30 @@ class LibraryService:
                 "UPDATE series SET is_favorite = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (1 if is_favorite else 0, series_id),
             )
+
+    def is_series_fully_read(self, series_id: int) -> bool:
+        row = self.db.conn.execute(
+            """
+            SELECT rp.series_id AS progress_exists,
+                   last_ep.episode_order AS last_read_order,
+                   max_ep.max_order AS max_order
+            FROM series s
+            LEFT JOIN reading_progress rp ON rp.series_id = s.id
+            LEFT JOIN episodes last_ep ON last_ep.id = rp.current_episode_id
+            LEFT JOIN (
+                SELECT series_id, MAX(episode_order) AS max_order
+                FROM episodes
+                GROUP BY series_id
+            ) max_ep ON max_ep.series_id = s.id
+            WHERE s.id = ?
+            """,
+            (series_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["progress_exists"] is None:
+            return False
+        return int(row["last_read_order"] or 0) >= int(row["max_order"] or 0)
 
     def list_custom_groups(self) -> list[sqlite3.Row]:
         return self.db.conn.execute("SELECT id, name FROM user_groups ORDER BY sort_order, id").fetchall()
@@ -218,7 +242,7 @@ class LibraryService:
     def get_series_details(self, series_id: int) -> dict | None:
         """获取漫画的详细属性"""
         row = self.db.conn.execute(
-            "SELECT id, name, author, tags FROM series WHERE id = ?",
+            "SELECT id, name, author, tags, cover_path FROM series WHERE id = ?",
             (series_id,),
         ).fetchone()
         if row is None:
@@ -229,6 +253,7 @@ class LibraryService:
             "name": str(row["name"]),
             "author": str(row["author"]),
             "tags": str(row["tags"]),
+            "cover_path": row["cover_path"],
             "group_id": group_id,
         }
 
@@ -246,19 +271,34 @@ class LibraryService:
             """
             SELECT
                 (SELECT SUM(image_count) FROM episodes WHERE series_id = ?) AS total_images,
-                (SELECT COUNT(*) FROM images WHERE episode_id IN 
-                    (SELECT id FROM episodes WHERE series_id = ? AND episode_number <= 
-                        (SELECT episode_number FROM episodes WHERE id = 
-                            (SELECT current_episode_id FROM reading_progress WHERE series_id = ?)
+                (
+                    SELECT COUNT(*)
+                    FROM images img
+                    JOIN episodes ep ON ep.id = img.episode_id
+                    WHERE ep.series_id = ?
+                      AND (
+                        ep.episode_order < (
+                            SELECT cep.episode_order
+                            FROM episodes cep
+                            WHERE cep.id = (SELECT current_episode_id FROM reading_progress WHERE series_id = ?)
                         )
-                    ) AND sort_order <= 
-                        (SELECT sort_order FROM images WHERE id = 
-                            (SELECT current_image_id FROM reading_progress WHERE series_id = ?)
+                        OR (
+                            ep.episode_order = (
+                                SELECT cep.episode_order
+                                FROM episodes cep
+                                WHERE cep.id = (SELECT current_episode_id FROM reading_progress WHERE series_id = ?)
+                            )
+                            AND img.sort_order <= (
+                                SELECT cimg.sort_order
+                                FROM images cimg
+                                WHERE cimg.id = (SELECT current_image_id FROM reading_progress WHERE series_id = ?)
+                            )
                         )
+                      )
                 ) AS read_images,
                 (SELECT current_episode_id FROM reading_progress WHERE series_id = ?)
             """,
-            (series_id, series_id, series_id, series_id, series_id),
+            (series_id, series_id, series_id, series_id, series_id, series_id),
         ).fetchone()
 
         if result is None or result[0] is None:
@@ -284,7 +324,7 @@ class LibraryService:
             FROM episodes ep
             JOIN images img ON img.episode_id = ep.id
             WHERE ep.series_id = ?
-            ORDER BY ep.episode_number DESC, img.sort_order DESC
+            ORDER BY ep.episode_order DESC, ep.episode_number DESC, img.sort_order DESC
             LIMIT 1
             """,
             (series_id,),
@@ -313,7 +353,7 @@ class LibraryService:
     def prune_missing_series(self) -> int:
         rows = self.db.conn.execute(
             """
-            SELECT DISTINCT s.id AS series_id, ep.folder_path, ep.data_path, img.file_path
+            SELECT DISTINCT s.id AS series_id, ep.folder_path, ep.data_path, ep.storage_mode, img.file_path
             FROM series s
             JOIN episodes ep ON ep.series_id = s.id
             LEFT JOIN images img ON img.episode_id = ep.id
@@ -323,9 +363,11 @@ class LibraryService:
         missing_ids: set[int] = set()
         for row in rows:
             series_id = int(row["series_id"])
+            storage_mode = str(row["storage_mode"] or "copy")
 
             folder_path = str(row["folder_path"] or "")
-            if folder_path and not Path(folder_path).exists():
+            # 引用模式必须依赖原路径；复制模式不要求原路径仍存在。
+            if storage_mode == "reference" and folder_path and not Path(folder_path).exists():
                 missing_ids.add(series_id)
                 continue
 
@@ -346,3 +388,104 @@ class LibraryService:
                 conn.execute("DELETE FROM series WHERE id = ?", (series_id,))
 
         return len(missing_ids)
+
+    def list_episodes(self, series_id: int) -> list[dict]:
+        """获取漫画的所有集数列表"""
+        rows = self.db.conn.execute(
+            """
+            SELECT id, episode_number, episode_name, episode_order, image_count, folder_path
+            FROM episodes
+            WHERE series_id = ?
+            ORDER BY episode_order ASC, id ASC
+            """,
+            (series_id,),
+        ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "episode_number": int(row["episode_number"]),
+                "episode_name": str(row["episode_name"] or f"第{int(row['episode_number'])}集"),
+                "episode_order": int(row["episode_order"]),
+                "image_count": int(row["image_count"]),
+                "folder_path": str(row["folder_path"]),
+            }
+            for row in rows
+        ]
+
+    def update_episodes_metadata(self, series_id: int, updates: list[dict]) -> None:
+        """批量更新每一集的集名和顺序"""
+        if not updates:
+            return
+
+        new_orders = [int(item["episode_order"]) for item in updates]
+        if len(new_orders) != len(set(new_orders)):
+            raise ValueError("顺序不能重复")
+
+        with self.db.transaction() as conn:
+            existing_ids = {
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM episodes WHERE series_id = ?",
+                    (series_id,),
+                ).fetchall()
+            }
+
+            for item in updates:
+                ep_id = int(item["id"])
+                if ep_id not in existing_ids:
+                    raise ValueError(f"集记录不存在: {ep_id}")
+
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET episode_name = ?, episode_order = ?
+                    WHERE id = ? AND series_id = ?
+                    """,
+                    (
+                        str(item["episode_name"]).strip() or f"第{int(item['episode_number'])}集",
+                        int(item["episode_order"]),
+                        ep_id,
+                        series_id,
+                    ),
+                )
+
+    def update_series_cover(self, series_id: int, cover_path: str | None) -> None:
+        """更新漫画封面
+        
+        Args:
+            series_id: 漫画ID
+            cover_path: 新封面路径，如果为None则清空封面
+        """
+        with self.db.transaction() as conn:
+            if cover_path:
+                new_path = Path(str(cover_path))
+                # 删除旧封面（仅在路径改变时删除，避免误删当前封面文件）
+                old_cover = conn.execute(
+                    "SELECT cover_path FROM series WHERE id = ?",
+                    (series_id,),
+                ).fetchone()
+                
+                if old_cover and old_cover["cover_path"]:
+                    try:
+                        old_path = Path(str(old_cover["cover_path"]))
+                        cover_root = COVER_ROOT.resolve()
+                        should_delete_old_cover = False
+                        if old_path.exists() and old_path != new_path:
+                            try:
+                                should_delete_old_cover = old_path.resolve().is_relative_to(cover_root)
+                            except Exception:
+                                should_delete_old_cover = False
+                        if should_delete_old_cover:
+                            old_path.unlink()
+                    except Exception:
+                        pass
+                
+                conn.execute(
+                    "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (cover_path, series_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE series SET cover_path = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (series_id,),
+                )

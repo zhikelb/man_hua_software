@@ -71,11 +71,18 @@ class ReaderService:
     def _load_series_images(self, series_id: int) -> list[dict]:
         rows = self.db.conn.execute(
             """
-            SELECT img.id AS image_id, img.file_path, img.sort_order, ep.id AS episode_id, ep.episode_number
+            SELECT
+                img.id AS image_id,
+                img.file_path,
+                img.sort_order,
+                ep.id AS episode_id,
+                ep.episode_number,
+                ep.episode_name,
+                ep.episode_order
             FROM episodes ep
             JOIN images img ON img.episode_id = ep.id
             WHERE ep.series_id = ?
-            ORDER BY ep.episode_number ASC, img.sort_order ASC
+            ORDER BY ep.episode_order ASC, ep.id ASC, img.sort_order ASC
             """,
             (series_id,),
         ).fetchall()
@@ -86,6 +93,8 @@ class ReaderService:
                 "sort_order": int(r["sort_order"]),
                 "episode_id": int(r["episode_id"]),
                 "episode_number": int(r["episode_number"]),
+                "episode_name": str(r["episode_name"] or ""),
+                "episode_order": int(r["episode_order"]),
             }
             for r in rows
         ]
@@ -135,9 +144,9 @@ class ReaderService:
 
     def _position_text(self) -> str:
         row = self.image_rows[self.current_index]
-        ep = row["episode_number"]
+        ep_name = str(row.get("episode_name") or "").strip() or f"第{row['episode_number']}集"
         page = row["sort_order"] + 1
-        return f"第{ep}集 · 第{page}页"
+        return f"{ep_name} · 第{page}页"
 
     def _save_progress(self) -> None:
         if self.current_series_id is None:
@@ -161,12 +170,14 @@ class ReaderService:
         if not self.image_rows:
             return False
 
-        current_episode = self.image_rows[self.current_index]["episode_number"]
+        current_episode_id = self.image_rows[self.current_index]["episode_id"]
         next_idx = next(
             (
                 i
                 for i, row in enumerate(self.image_rows)
-                if row["episode_number"] == current_episode + 1 and row["sort_order"] == 0
+                if i > self.current_index
+                and row["episode_id"] != current_episode_id
+                and row["sort_order"] == 0
             ),
             None,
         )
@@ -245,11 +256,11 @@ class ReaderService:
         self._preload_neighbors()
         return True
 
-    def jump_to_position(self, episode_number: int, page: int | None = None) -> bool:
+    def jump_to_position(self, episode_order: int, page: int | None = None) -> bool:
         """跳转到特定位置
         
         Args:
-            episode_number: 集数
+            episode_order: 顺序
             page: 页码（从1开始），如果为None则跳转到该集的第一页
         
         Returns:
@@ -263,7 +274,7 @@ class ReaderService:
             (
                 i
                 for i, row in enumerate(self.image_rows)
-                if row["episode_number"] == episode_number and row["sort_order"] == target_sort_order
+                if row["episode_order"] == episode_order and row["sort_order"] == target_sort_order
             ),
             None,
         )

@@ -18,7 +18,7 @@ COVER_ROOT = DATA_DIR / "covers"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "import": {
-        "default_storage_mode": "reference",
+        "default_storage_mode": "copy",
         "hash_check_on_duplicate": True,
         "duplicate_content_policy": "skip",
     },
