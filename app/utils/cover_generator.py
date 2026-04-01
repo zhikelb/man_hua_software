@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -26,7 +27,8 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 def render_name_author_cover(series_id: int, name: str, author: str) -> Path:
     COVER_ROOT.mkdir(parents=True, exist_ok=True)
-    path = COVER_ROOT / f"series_{series_id}_text_cover.png"
+    token = hashlib.sha1(f"{series_id}|{name}|{author}".encode("utf-8")).hexdigest()[:16]
+    path = COVER_ROOT / f"cover_{token}.png"
 
     image = Image.new("RGB", (900, 1200), color=(40, 48, 72))
     draw = ImageDraw.Draw(image)
@@ -46,6 +48,12 @@ def render_name_author_cover(series_id: int, name: str, author: str) -> Path:
 def store_cover_image(series_id: int, source_path: Path) -> Path:
     COVER_ROOT.mkdir(parents=True, exist_ok=True)
     suffix = source_path.suffix.lower() if source_path.suffix else ".png"
-    target = COVER_ROOT / f"series_{series_id}_cover{suffix}"
+    digest = hashlib.sha1(source_path.read_bytes()).hexdigest()[:16]
+    target = COVER_ROOT / f"cover_{digest}{suffix}"
+    try:
+        if source_path.resolve() == target.resolve():
+            return target
+    except Exception:
+        pass
     shutil.copy2(source_path, target)
     return target

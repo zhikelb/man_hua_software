@@ -391,9 +391,6 @@ class ReaderWindow(QWidget):
         self.position_label.setText(text)
         self.refresh_view()
 
-    def _on_render_mode_changed(self) -> None:
-        self._scaled_cache.clear()
-        self.refresh_view()
         if finished and not self._finished_prompt_shown:
             self._finished_prompt_shown = True
             box = QMessageBox(self)
@@ -403,6 +400,10 @@ class ReaderWindow(QWidget):
             box.setStandardButtons(QMessageBox.StandardButton.Close)
             box.exec()
 
+    def _on_render_mode_changed(self) -> None:
+        self._scaled_cache.clear()
+        self.refresh_view()
+
     def _go_previous(self) -> None:
         pix, text = self.reader_service.previous_image()
         self.current_pixmap = pix
@@ -411,8 +412,9 @@ class ReaderWindow(QWidget):
         self.refresh_view()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.progress_changed.emit(self.series_id)
         super().closeEvent(event)
+        series_id = self.series_id
+        QTimer.singleShot(0, lambda sid=series_id: self.progress_changed.emit(sid))
 
     def add_bookmark(self) -> None:
         """添加书签"""

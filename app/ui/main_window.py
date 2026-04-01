@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
-from PyQt6.QtCore import QMimeData, QPoint, QSize, Qt, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import QMimeData, QPoint, QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QIcon, QKeyEvent, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.config import save_config, IMPORT_COPY_ROOT
+from app.config import save_config
 from app.services.import_service import ImportService
 from app.services.library_service import LibraryService, SeriesItem
 from app.services.reader_service import ReaderService
@@ -39,6 +41,7 @@ from app.services.export_service import ExportService
 from app.ui.import_dialog import ImportDialog
 from app.ui.edit_series_dialog import EditSeriesDialog
 from app.ui.reader_window import ReaderWindow
+from app.utils.cover_generator import store_cover_image
 from app.utils.global_hotkey import WindowsGlobalHotkeyManager
 
 
@@ -213,6 +216,10 @@ class MainWindow(QMainWindow):
         self.config = config
         self.reader_windows: list[ReaderWindow] = []
         self.global_hotkey_manager: WindowsGlobalHotkeyManager | None = None
+        self._last_prune_check_at = 0.0
+        self._prune_interval_seconds = 45.0
+        self._cover_icon_cache: dict[tuple[str, int, int, float], QIcon] = {}
+        self._fallback_icon_cache: dict[tuple[int, int], QIcon] = {}
 
         self.setWindowTitle("漫画软件 MVP")
         self.resize(1200, 800)
@@ -301,6 +308,8 @@ class MainWindow(QMainWindow):
 
         self.series_list.setIconSize(QSize(icon_width, icon_height))
         self.series_list.setGridSize(QSize(grid_width, grid_height))
+        self._cover_icon_cache.clear()
+        self._fallback_icon_cache.clear()
 
     def _setup_ui(self) -> None:
         root = QWidget()
@@ -899,9 +908,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def reload_library(self) -> None:
-        removed = self.library_service.prune_missing_series()
-        if removed > 0:
-            self.statusBar().showMessage(f"检测到 {removed} 部漫画源文件已丢失，已自动移除", 5000)
+        now = monotonic()
+        if now - self._last_prune_check_at >= self._prune_interval_seconds:
+            removed = self.library_service.prune_missing_series()
+            self._last_prune_check_at = now
+            if removed > 0:
+                self.statusBar().showMessage(f"检测到 {removed} 部漫画源文件已丢失，已自动移除", 5000)
 
         self._reload_custom_groups()
         keyword = self.search_edit.text().strip()
@@ -914,12 +926,14 @@ class MainWindow(QMainWindow):
         else:
             items = self.library_service.list_series(self.current_category, keyword, sort_by, sort_order)
 
+        series_ids = [item.id for item in items]
+        progress_map = self.library_service.get_reading_progress_map(series_ids)
+
         self.series_list.clear()
         for item in items:
-            self.series_list.addItem(self._build_series_item(item))
+            self.series_list.addItem(self._build_series_item(item, progress_map.get(item.id)))
 
-    def _build_series_item(self, series: SeriesItem) -> QListWidgetItem:
-        progress = self.library_service.get_reading_progress(series.id)
+    def _build_series_item(self, series: SeriesItem, progress: tuple[int, int] | None) -> QListWidgetItem:
         title = self._compose_series_title(
             name=series.name,
             author=series.author,
@@ -960,7 +974,14 @@ class MainWindow(QMainWindow):
         icon_width = int(self.config.setdefault("ui", {}).get("icon_size", 140))
         icon_height = int(icon_width * 1.357)
         if cover_path and Path(cover_path).exists():
-            pix = QPixmap(cover_path)
+            path = Path(cover_path)
+            mtime = path.stat().st_mtime
+            key = (str(path), icon_width, icon_height, mtime)
+            cached_icon = self._cover_icon_cache.get(key)
+            if cached_icon is not None:
+                return cached_icon
+
+            pix = QPixmap(str(path))
             if not pix.isNull():
                 scaled = pix.scaled(
                     icon_width,
@@ -968,11 +989,20 @@ class MainWindow(QMainWindow):
                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                return QIcon(scaled)
+                icon = QIcon(scaled)
+                self._cover_icon_cache[key] = icon
+                return icon
+
+        fallback_key = (icon_width, icon_height)
+        fallback_icon = self._fallback_icon_cache.get(fallback_key)
+        if fallback_icon is not None:
+            return fallback_icon
 
         fallback = QPixmap(icon_width, icon_height)
         fallback.fill(Qt.GlobalColor.lightGray)
-        return QIcon(fallback)
+        icon = QIcon(fallback)
+        self._fallback_icon_cache[fallback_key] = icon
+        return icon
 
     def open_reader_for_item(self, item: QListWidgetItem) -> None:
         series_id = int(item.data(Qt.ItemDataRole.UserRole))
@@ -985,18 +1015,35 @@ class MainWindow(QMainWindow):
                 series_name,
                 self.config.get("reader", {}),
             )
+            window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
             window.progress_changed.connect(self.on_reader_progress_changed)
             window.cover_changed.connect(self.on_reader_cover_changed)
+            window.destroyed.connect(self._cleanup_reader_windows)
             window.show()
             self.reader_windows.append(window)
         except Exception as exc:
             self._show_error("无法打开阅读器", str(exc))
 
-    def on_reader_progress_changed(self, _series_id: int) -> None:
-        self.reload_library()
+    def _cleanup_reader_windows(self, *_args) -> None:
+        alive_windows: list[ReaderWindow] = []
+        for window in self.reader_windows:
+            if window is None:
+                continue
+            try:
+                if sip.isdeleted(window):
+                    continue
+                alive_windows.append(window)
+            except RuntimeError:
+                continue
+        self.reader_windows = alive_windows
+
+    def on_reader_progress_changed(self, series_id: int) -> None:
+        # 关闭阅读窗口后优先做轻量更新，避免大库全量重载导致UI卡顿。
+        QTimer.singleShot(0, lambda sid=series_id: self._update_single_series_progress(sid))
 
     def on_reader_cover_changed(self, series_id: int) -> None:
-        self.reload_library()
+        self._cover_icon_cache.clear()
+        self._refresh_single_series_cover(series_id)
 
     def _refresh_single_series_cover(self, series_id: int) -> None:
         for row in range(self.series_list.count()):
@@ -1143,20 +1190,9 @@ class MainWindow(QMainWindow):
             
             # 处理封面更新
             if cover_path is not None:
-                # 如果选择了新封面，需要复制到数据目录
-                if cover_path and Path(cover_path).exists() and not str(cover_path).startswith(str(IMPORT_COPY_ROOT)):
-                    import shutil
-                    from datetime import datetime
-                    
-                    # 生成新的封面文件名
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    new_cover_name = f"cover_{series_id}_{timestamp}.jpg"
-                    covers_dir = Path(IMPORT_COPY_ROOT) / "covers"
-                    covers_dir.mkdir(exist_ok=True)
-                    new_cover_path = covers_dir / new_cover_name
-                    
-                    # 复制封面文件
-                    shutil.copy2(cover_path, new_cover_path)
+                # 选择了新封面时，统一走封面存储工具（哈希命名）。
+                if cover_path and Path(cover_path).exists():
+                    new_cover_path = store_cover_image(series_id, Path(cover_path))
                     self.library_service.update_series_cover(series_id, str(new_cover_path))
                 elif not cover_path:
                     # 清空封面

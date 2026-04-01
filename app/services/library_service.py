@@ -313,6 +313,74 @@ class LibraryService:
 
         return (read_images, total_images)
 
+    def get_reading_progress_map(self, series_ids: list[int]) -> dict[int, tuple[int, int] | None]:
+        """批量获取阅读进度，减少列表刷新时的数据库查询次数。"""
+        if not series_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in series_ids)
+        sql = f"""
+            WITH target AS (
+                SELECT id AS series_id
+                FROM series
+                WHERE id IN ({placeholders})
+            ),
+            totals AS (
+                SELECT ep.series_id, COALESCE(SUM(ep.image_count), 0) AS total_images
+                FROM episodes ep
+                WHERE ep.series_id IN ({placeholders})
+                GROUP BY ep.series_id
+            ),
+            rp AS (
+                SELECT
+                    rp.series_id,
+                    cep.episode_order AS current_episode_order,
+                    cimg.sort_order AS current_sort_order
+                FROM reading_progress rp
+                JOIN episodes cep ON cep.id = rp.current_episode_id
+                JOIN images cimg ON cimg.id = rp.current_image_id
+                WHERE rp.series_id IN ({placeholders})
+            ),
+            reads AS (
+                SELECT ep.series_id, COUNT(*) AS read_images
+                FROM episodes ep
+                JOIN images img ON img.episode_id = ep.id
+                JOIN rp ON rp.series_id = ep.series_id
+                WHERE ep.series_id IN ({placeholders})
+                  AND (
+                    ep.episode_order < rp.current_episode_order
+                    OR (
+                        ep.episode_order = rp.current_episode_order
+                        AND img.sort_order <= rp.current_sort_order
+                    )
+                  )
+                GROUP BY ep.series_id
+            )
+            SELECT
+                t.series_id,
+                COALESCE(totals.total_images, 0) AS total_images,
+                CASE WHEN rp.series_id IS NULL THEN 0 ELSE 1 END AS has_progress,
+                COALESCE(reads.read_images, 0) AS read_images
+            FROM target t
+            LEFT JOIN totals ON totals.series_id = t.series_id
+            LEFT JOIN rp ON rp.series_id = t.series_id
+            LEFT JOIN reads ON reads.series_id = t.series_id
+        """
+        params = series_ids + series_ids + series_ids + series_ids
+        rows = self.db.conn.execute(sql, params).fetchall()
+
+        result: dict[int, tuple[int, int] | None] = {sid: None for sid in series_ids}
+        for row in rows:
+            sid = int(row["series_id"])
+            total_images = int(row["total_images"] or 0)
+            has_progress = bool(int(row["has_progress"] or 0))
+            read_images = int(row["read_images"] or 0)
+            if has_progress and total_images > 0:
+                result[sid] = (read_images, total_images)
+            else:
+                result[sid] = None
+        return result
+
     def clear_reading_progress(self, series_id: int) -> None:
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM reading_progress WHERE series_id = ?", (series_id,))
