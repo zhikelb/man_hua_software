@@ -5,6 +5,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -92,15 +93,44 @@ class CoverSelector(QWidget):
         return self.selected_cover_path
 
 
+class EpisodeOrderSpinBox(QSpinBox):
+    def __init__(self, editor: "EpisodeEditorWidget", episode_id: int, parent=None) -> None:
+        super().__init__(parent)
+        self.editor = editor
+        self.episode_id = episode_id
+        self.setReadOnly(True)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lineEdit().setReadOnly(True)
+
+    def stepBy(self, steps: int) -> None:
+        if steps > 0:
+            self.editor.move_episode_by_id(self.episode_id, 1)
+        elif steps < 0:
+            self.editor.move_episode_by_id(self.episode_id, -1)
+
+    def stepEnabled(self) -> QAbstractSpinBox.StepEnabled:
+        enabled = QAbstractSpinBox.StepEnabledFlag.StepNone
+        if self.editor.can_move_episode(self.episode_id, -1):
+            enabled |= QAbstractSpinBox.StepEnabledFlag.StepDownEnabled
+        if self.editor.can_move_episode(self.episode_id, 1):
+            enabled |= QAbstractSpinBox.StepEnabledFlag.StepUpEnabled
+        return enabled
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 class EpisodeEditorWidget(QWidget):
     def __init__(self, episodes: list[dict], parent=None) -> None:
         super().__init__(parent)
-        self.episodes = episodes
-        self.order_spins: dict[int, QSpinBox] = {}
+        self.episodes = [dict(ep) for ep in episodes]
+        self.order_spins: dict[int, EpisodeOrderSpinBox] = {}
         self.name_edits: dict[int, QLineEdit] = {}
+        self.deleted_episode_ids: list[int] = []
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("可修改每一集的集名和顺序。顺序必须唯一。"))
+        layout.addWidget(QLabel("可修改每一集的集名，并使用顺序列右侧箭头调整集顺序。"))
 
         self.table = QTableWidget(self)
         self.table.setColumnCount(4)
@@ -109,7 +139,6 @@ class EpisodeEditorWidget(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-
         max_order = max((int(ep["episode_order"]) for ep in episodes), default=1)
 
         for row_idx, ep in enumerate(episodes):
@@ -125,9 +154,9 @@ class EpisodeEditorWidget(QWidget):
             self.table.setCellWidget(row_idx, 1, name_edit)
             self.name_edits[ep_id] = name_edit
 
-            order_spin = QSpinBox()
+            order_spin = EpisodeOrderSpinBox(self, ep_id)
             order_spin.setMinimum(1)
-            order_spin.setMaximum(max(max_order, len(episodes)) + 999)
+            order_spin.setMaximum(max(max_order, len(episodes), 1))
             order_spin.setValue(int(ep["episode_order"]))
             self.table.setCellWidget(row_idx, 2, order_spin)
             self.order_spins[ep_id] = order_spin
@@ -139,18 +168,20 @@ class EpisodeEditorWidget(QWidget):
         self.table.resizeColumnsToContents()
         layout.addWidget(self.table)
 
-        move_row = QHBoxLayout()
-        self.move_up_btn = QPushButton("上移")
-        self.move_down_btn = QPushButton("下移")
-        self.move_up_btn.clicked.connect(self.move_selected_up)
-        self.move_down_btn.clicked.connect(self.move_selected_down)
-        move_row.addWidget(self.move_up_btn)
-        move_row.addWidget(self.move_down_btn)
-        move_row.addStretch()
-        layout.addLayout(move_row)
+        action_row = QHBoxLayout()
+        self.delete_episode_btn = QPushButton("删除选中单集")
+        self.delete_episode_btn.clicked.connect(self.delete_selected_episode)
+        action_row.addWidget(self.delete_episode_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+        self.table.itemSelectionChanged.connect(self._refresh_action_buttons)
 
         if episodes:
             self.table.selectRow(0)
+            self.table.setCurrentCell(0, 1)
+
+        self._refresh_action_buttons()
 
     def _current_row(self) -> int | None:
         row = self.table.currentRow()
@@ -160,6 +191,9 @@ class EpisodeEditorWidget(QWidget):
             self.table.selectRow(0)
             return 0
         return None
+
+    def _row_to_episode_id(self, row: int) -> int:
+        return int(self.episodes[row]["id"])
 
     def _sorted_rows_by_order(self) -> list[int]:
         rows = list(range(self.table.rowCount()))
@@ -171,9 +205,29 @@ class EpisodeEditorWidget(QWidget):
         )
         return rows
 
+    def _row_for_episode_id(self, episode_id: int) -> int | None:
+        for row_idx, ep in enumerate(self.episodes):
+            if int(ep["id"]) == episode_id:
+                return row_idx
+        return None
+
+    def _refresh_order_controls(self) -> None:
+        for spin in self.order_spins.values():
+            spin.update()
+
+    def _refresh_action_buttons(self) -> None:
+        current_row = self.table.currentRow()
+        self.delete_episode_btn.setEnabled(current_row >= 0 and self.table.rowCount() > 1)
+
+    def _renumber_orders(self) -> None:
+        for new_order, row in enumerate(self._sorted_rows_by_order(), start=1):
+            ep_id = self._row_to_episode_id(row)
+            self.order_spins[ep_id].setValue(new_order)
+        self._refresh_order_controls()
+
     def _swap_row_order(self, row_a: int, row_b: int) -> None:
-        ep_id_a = int(self.episodes[row_a]["id"])
-        ep_id_b = int(self.episodes[row_b]["id"])
+        ep_id_a = self._row_to_episode_id(row_a)
+        ep_id_b = self._row_to_episode_id(row_b)
         spin_a = self.order_spins[ep_id_a]
         spin_b = self.order_spins[ep_id_b]
         value_a = int(spin_a.value())
@@ -181,8 +235,20 @@ class EpisodeEditorWidget(QWidget):
         spin_a.setValue(value_b)
         spin_b.setValue(value_a)
 
-    def _move_selected(self, direction: int) -> None:
-        row = self._current_row()
+    def can_move_episode(self, episode_id: int, direction: int) -> bool:
+        row = self._row_for_episode_id(episode_id)
+        if row is None:
+            return False
+        ordered_rows = self._sorted_rows_by_order()
+        try:
+            idx = ordered_rows.index(row)
+        except ValueError:
+            return False
+        target_idx = idx + direction
+        return 0 <= target_idx < len(ordered_rows)
+
+    def move_episode_by_id(self, episode_id: int, direction: int) -> None:
+        row = self._row_for_episode_id(episode_id)
         if row is None:
             return
 
@@ -196,17 +262,46 @@ class EpisodeEditorWidget(QWidget):
         if target_idx < 0 or target_idx >= len(ordered_rows):
             return
 
-        target_row = ordered_rows[target_idx]
-        self._swap_row_order(row, target_row)
+        self._swap_row_order(row, ordered_rows[target_idx])
+        self._refresh_order_controls()
         # 保持选中同一集名所在行，持续调整同一集的顺序。
         self.table.selectRow(row)
         self.table.setCurrentCell(row, 1)
+        self._refresh_action_buttons()
 
-    def move_selected_up(self) -> None:
-        self._move_selected(-1)
+    def delete_selected_episode(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        if self.table.rowCount() <= 1:
+            QMessageBox.information(self, "提示", "至少保留一集，如需全部删除请直接删除漫画。")
+            return
 
-    def move_selected_down(self) -> None:
-        self._move_selected(1)
+        episode = self.episodes[row]
+        episode_name = str(episode.get("episode_name") or f"第{int(episode['episode_number'])}集").strip()
+        response = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除单集《{episode_name}》吗？\n该操作会在保存后生效。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+
+        ep_id = int(episode["id"])
+        self.deleted_episode_ids.append(ep_id)
+        self.episodes.pop(row)
+        self.order_spins.pop(ep_id, None)
+        self.name_edits.pop(ep_id, None)
+        self.table.removeRow(row)
+        self._renumber_orders()
+
+        if self.table.rowCount() > 0:
+            next_row = min(row, self.table.rowCount() - 1)
+            self.table.selectRow(next_row)
+            self.table.setCurrentCell(next_row, 1)
+        self._refresh_action_buttons()
 
     def get_episode_updates(self) -> list[dict]:
         updates: list[dict] = []
@@ -223,6 +318,9 @@ class EpisodeEditorWidget(QWidget):
                 }
             )
         return updates
+
+    def get_deleted_episode_ids(self) -> list[int]:
+        return self.deleted_episode_ids.copy()
 
 
 class EditSeriesDialog(QDialog):
@@ -356,10 +454,12 @@ class EditSeriesDialog(QDialog):
 
         self.accept()
 
-    def get_edited_data(self) -> tuple[str, str, str, int | None, str | None, list[dict], list[str]]:
+    def get_edited_data(self) -> tuple[str, str, str, int | None, str | None, list[dict], list[int], list[str]]:
         episode_updates: list[dict] = []
+        deleted_episode_ids: list[int] = []
         if self.episode_widget is not None:
             episode_updates = self.episode_widget.get_episode_updates()
+            deleted_episode_ids = self.episode_widget.get_deleted_episode_ids()
 
         return (
             self.name_edit.text().strip(),
@@ -368,5 +468,6 @@ class EditSeriesDialog(QDialog):
             self.group_combo.currentData(),
             self.cover_selector.get_selected_cover_path(),
             episode_updates,
+            deleted_episode_ids,
             self.new_episode_folders.copy(),
         )

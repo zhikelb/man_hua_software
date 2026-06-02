@@ -1242,7 +1242,8 @@ class MainWindow(QMainWindow):
         if dialog.exec() != EditSeriesDialog.DialogCode.Accepted:
             return
 
-        name, author, tags, group_id, cover_path, episode_updates, new_episode_folders = dialog.get_edited_data()
+        original_cover_path = details.get("cover_path")
+        name, author, tags, group_id, cover_path, episode_updates, deleted_episode_ids, new_episode_folders = dialog.get_edited_data()
         try:
             self.library_service.edit_series(series_id, name, author, tags)
             
@@ -1252,6 +1253,9 @@ class MainWindow(QMainWindow):
             else:
                 self.library_service.move_series_to_group(series_id, int(group_id))
             
+            if deleted_episode_ids:
+                self.library_service.delete_episodes(series_id, deleted_episode_ids)
+
             # 处理每集集名和顺序更新
             if episode_updates:
                 self.library_service.update_episodes_metadata(series_id, episode_updates)
@@ -1280,23 +1284,24 @@ class MainWindow(QMainWindow):
                     )
             
             # 处理封面更新
-            if cover_path is not None:
+            if cover_path != original_cover_path:
                 # 选择了新封面时，统一走封面存储工具（哈希命名）。
-                if cover_path and Path(cover_path).exists():
+                if cover_path:
+                    if not Path(cover_path).exists():
+                        raise ValueError("所选封面文件不存在")
                     new_cover_path = store_cover_image(series_id, Path(cover_path))
                     self.library_service.update_series_cover(series_id, str(new_cover_path))
-                elif not cover_path:
+                else:
                     # 清空封面
                     self.library_service.update_series_cover(series_id, None)
-                else:
-                    # 使用已有的封面路径
-                    self.library_service.update_series_cover(series_id, cover_path)
-            
+             
             self.reload_library()
+            message_parts = ["漫画属性已更新"]
+            if deleted_episode_ids:
+                message_parts.append(f"删除 {len(deleted_episode_ids)} 集")
             if new_episode_folders:
-                self.statusBar().showMessage(f"漫画属性已更新，并新增 {len(new_episode_folders)} 集", 4000)
-            else:
-                self.statusBar().showMessage("漫画属性已更新", 3000)
+                message_parts.append(f"新增 {len(new_episode_folders)} 集")
+            self.statusBar().showMessage("，".join(message_parts), 4000)
         except Exception as exc:
             self._show_error("更新失败", str(exc))
 

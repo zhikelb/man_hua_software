@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -24,12 +24,18 @@ if (-not (Test-Path (Join-Path $root "requirements.txt"))) {
 
 Write-Host "Installing/checking dependencies..." -ForegroundColor Cyan
 & $python -m pip install -r (Join-Path $root "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency installation failed with exit code $LASTEXITCODE"
+}
 
 if (Test-Path $distRoot) { Remove-Item $distRoot -Recurse -Force }
 if (Test-Path $buildRoot) { Remove-Item $buildRoot -Recurse -Force }
 
 Write-Host "Building portable package with PyInstaller..." -ForegroundColor Cyan
 & $pyinstaller "packaging\build_exe.spec" --distpath $distRoot --workpath $buildRoot --clean
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller build failed with exit code $LASTEXITCODE"
+}
 
 $portableSourceDir = Get-ChildItem -Path $distRoot -Directory | Select-Object -First 1
 if ($null -eq $portableSourceDir) {

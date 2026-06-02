@@ -30,6 +30,54 @@ class LibraryService:
     def __init__(self, db: Database) -> None:
         self.db = db
 
+    def _normalize_path_text(self, path_text: str) -> str:
+        try:
+            return str(Path(path_text).resolve())
+        except Exception:
+            return str(Path(path_text))
+
+    def _prune_empty_import_dirs(self, deleted_paths: list[Path]) -> None:
+        for deleted in deleted_paths:
+            parent = deleted.parent
+            while parent != IMPORT_COPY_ROOT and parent.exists() and parent.is_dir():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
+    def _set_series_cover_from_first_remaining_image(self, series_id: int, old_cover_path: Path | None = None) -> None:
+        if old_cover_path is not None:
+            try:
+                clear_cover_display_cache_for_source(old_cover_path)
+                delete_managed_cover_source(old_cover_path)
+            except Exception:
+                pass
+
+        row = self.db.conn.execute(
+            """
+            SELECT img.file_path
+            FROM episodes ep
+            JOIN images img ON img.episode_id = ep.id
+            WHERE ep.series_id = ?
+            ORDER BY ep.episode_order ASC, ep.id ASC, img.sort_order ASC
+            LIMIT 1
+            """,
+            (series_id,),
+        ).fetchone()
+
+        cover_path: str | None = None
+        if row is not None:
+            candidate = Path(str(row["file_path"] or ""))
+            if candidate.exists() and candidate.is_file():
+                cover_path = str(candidate)
+
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (cover_path, series_id),
+            )
+
     def list_series(self, category: str = "all", keyword: str = "", sort_by: str = "updated_at", sort_order: str = "desc") -> list[SeriesItem]:
         sql = """
             SELECT s.id, s.name, s.author, s.total_episodes, s.cover_path, s.is_favorite,
@@ -289,14 +337,7 @@ class LibraryService:
                     pass  # 忽略删除文件时的错误
 
         # 清理导入根目录下可能遗留的空目录，保持数据目录整洁。
-        for deleted in deleted_paths:
-            parent = deleted.parent
-            while parent != IMPORT_COPY_ROOT and parent.exists() and parent.is_dir():
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
-                parent = parent.parent
+        self._prune_empty_import_dirs(deleted_paths)
         
         # 删除封面文件
         cover_path_result = self.db.conn.execute(
@@ -318,6 +359,106 @@ class LibraryService:
 
         # 删除后清理未使用封面，兼容旧 data 目录中的历史遗留封面。
         self.cleanup_unused_cover_files()
+
+    def delete_episodes(self, series_id: int, episode_ids: list[int]) -> int:
+        target_ids = sorted({int(ep_id) for ep_id in episode_ids})
+        if not target_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in target_ids)
+        count_row = self.db.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM episodes WHERE series_id = ?",
+            (series_id,),
+        ).fetchone()
+        current_count = int(count_row["cnt"] or 0) if count_row is not None else 0
+
+        episode_rows = self.db.conn.execute(
+            f"""
+            SELECT id, data_path
+            FROM episodes
+            WHERE series_id = ? AND id IN ({placeholders})
+            """,
+            [series_id, *target_ids],
+        ).fetchall()
+        if len(episode_rows) != len(target_ids):
+            raise ValueError("部分集记录不存在")
+        if current_count <= len(target_ids):
+            raise ValueError("至少保留一集，如需全部删除请直接删除漫画")
+
+        deleted_paths = [
+            Path(str(row["data_path"]))
+            for row in episode_rows
+            if row["data_path"] and Path(str(row["data_path"])).exists()
+        ]
+
+        cover_row = self.db.conn.execute(
+            "SELECT cover_path FROM series WHERE id = ?",
+            (series_id,),
+        ).fetchone()
+        old_cover_path_text = str(cover_row["cover_path"] or "").strip() if cover_row else ""
+        old_cover_path = Path(old_cover_path_text) if old_cover_path_text else None
+        reset_cover = False
+
+        if old_cover_path_text:
+            normalized_cover = self._normalize_path_text(old_cover_path_text)
+            image_rows = self.db.conn.execute(
+                f"""
+                SELECT file_path
+                FROM images
+                WHERE episode_id IN ({placeholders})
+                """,
+                target_ids,
+            ).fetchall()
+            deleted_image_paths = {
+                self._normalize_path_text(str(row["file_path"] or ""))
+                for row in image_rows
+                if str(row["file_path"] or "").strip()
+            }
+            reset_cover = normalized_cover in deleted_image_paths
+
+            if not reset_cover:
+                for row in episode_rows:
+                    data_path_text = str(row["data_path"] or "").strip()
+                    if not data_path_text:
+                        continue
+                    try:
+                        if Path(normalized_cover).is_relative_to(Path(data_path_text).resolve()):
+                            reset_cover = True
+                            break
+                    except Exception:
+                        continue
+
+        with self.db.transaction() as conn:
+            conn.execute(
+                f"DELETE FROM episodes WHERE series_id = ? AND id IN ({placeholders})",
+                [series_id, *target_ids],
+            )
+            remaining_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM episodes WHERE series_id = ?",
+                    (series_id,),
+                ).fetchone()["cnt"]
+            )
+            conn.execute(
+                "UPDATE series SET total_episodes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (remaining_count, series_id),
+            )
+
+        for path in deleted_paths:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+            except Exception:
+                pass
+        self._prune_empty_import_dirs(deleted_paths)
+
+        if old_cover_path is not None:
+            cover_missing = not old_cover_path.exists()
+            if reset_cover or cover_missing:
+                self._set_series_cover_from_first_remaining_image(series_id, old_cover_path)
+
+        self.cleanup_unused_cover_files()
+        return len(target_ids)
 
     def get_series_details(self, series_id: int) -> dict | None:
         """获取漫画的详细属性"""
