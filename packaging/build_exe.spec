@@ -10,9 +10,7 @@ a = Analysis(
     [str(project_root / "run.py")],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[
-        (str(project_root / "data"), "data"),
-    ],
+    datas=[],
     hiddenimports=[
         "PyQt6",
         "PyQt6.QtCore",
