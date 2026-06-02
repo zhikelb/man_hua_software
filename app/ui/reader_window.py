@@ -29,7 +29,6 @@ from PyQt6.QtWidgets import (
 
 from app.services.library_service import LibraryService
 from app.services.reader_service import ReaderService
-from app.utils.cover_generator import store_cover_image
 
 if TYPE_CHECKING:
     from PyQt6.QtCore import QObject
@@ -268,8 +267,7 @@ class ReaderWindow(QWidget):
             image_path = Path(str(row["file_path"]))
             if not image_path.exists():
                 raise ValueError("当前图片文件不存在")
-            cover_path = store_cover_image(self.series_id, image_path)
-            self.library_service.update_series_cover(self.series_id, str(cover_path))
+            self.library_service.update_series_cover(self.series_id, str(image_path))
             self.cover_changed.emit(self.series_id)
             QMessageBox.information(self, "提示", "已设置为漫画封面", QMessageBox.StandardButton.Ok)
         except Exception as exc:

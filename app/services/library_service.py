@@ -7,6 +7,13 @@ from dataclasses import dataclass
 
 from app.database import Database
 from app.config import COVER_ROOT, IMPORT_COPY_ROOT
+from app.utils.cover_generator import (
+    SOURCE_CACHE_ROOT,
+    DISPLAY_CACHE_ROOT,
+    clear_cover_display_cache_for_source,
+    delete_managed_cover_source,
+    get_cover_source_token,
+)
 
 
 @dataclass
@@ -179,6 +186,76 @@ class LibraryService:
             return None
         return int(row["group_id"])
 
+    def migrate_legacy_cover_paths(self) -> int:
+        """将旧版 data/covers/cover_*.png 封面索引增量迁移到 data/imports 源图。"""
+        rows = self.db.conn.execute(
+            "SELECT id, cover_path FROM series WHERE cover_path IS NOT NULL"
+        ).fetchall()
+
+        updated = 0
+        try:
+            cover_root = COVER_ROOT.resolve()
+        except Exception:
+            cover_root = COVER_ROOT
+
+        with self.db.transaction() as conn:
+            for row in rows:
+                series_id = int(row["id"])
+                raw_cover = str(row["cover_path"] or "").strip()
+                if not raw_cover:
+                    continue
+
+                path = Path(raw_cover)
+                try:
+                    resolved = path.resolve()
+                except Exception:
+                    continue
+
+                try:
+                    is_legacy_cover = resolved.is_relative_to(cover_root) and path.name.startswith("cover_")
+                except Exception:
+                    is_legacy_cover = False
+                if not is_legacy_cover:
+                    continue
+
+                source = self._find_cover_source_from_imports(series_id)
+                if source is None:
+                    continue
+
+                conn.execute(
+                    "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(source), series_id),
+                )
+                updated += 1
+
+        if updated > 0:
+            self.cleanup_unused_cover_files()
+        return updated
+
+    def _find_cover_source_from_imports(self, series_id: int) -> Path | None:
+        row = self.db.conn.execute(
+            """
+            SELECT img.file_path
+            FROM episodes ep
+            JOIN images img ON img.episode_id = ep.id
+            WHERE ep.series_id = ?
+            ORDER BY ep.episode_order ASC, ep.id ASC, img.sort_order ASC
+            LIMIT 1
+            """,
+            (series_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        path = Path(str(row["file_path"] or "")).resolve()
+        try:
+            imports_root = IMPORT_COPY_ROOT.resolve()
+            if path.is_relative_to(imports_root) and path.exists() and path.is_file():
+                return path
+        except Exception:
+            return None
+        return None
+
     def delete_series(self, series_id: int) -> None:
         """删除漫画及其所有数据
         
@@ -230,14 +307,17 @@ class LibraryService:
         if cover_path_result and cover_path_result["cover_path"]:
             try:
                 cover_path = Path(str(cover_path_result["cover_path"]))
-                if cover_path.exists():
-                    cover_path.unlink()
+                clear_cover_display_cache_for_source(cover_path)
+                delete_managed_cover_source(cover_path)
             except Exception:
                 pass  # 忽略删除文件时的错误
         
         # 从数据库删除记录（级联删除会自动删除episodes、images等）
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM series WHERE id = ?", (series_id,))
+
+        # 删除后清理未使用封面，兼容旧 data 目录中的历史遗留封面。
+        self.cleanup_unused_cover_files()
 
     def get_series_details(self, series_id: int) -> dict | None:
         """获取漫画的详细属性"""
@@ -524,30 +604,16 @@ class LibraryService:
             series_id: 漫画ID
             cover_path: 新封面路径，如果为None则清空封面
         """
+        old_path_text = ""
         with self.db.transaction() as conn:
+            old_cover = conn.execute(
+                "SELECT cover_path FROM series WHERE id = ?",
+                (series_id,),
+            ).fetchone()
+            old_path_text = str(old_cover["cover_path"] or "").strip() if old_cover else ""
+
             if cover_path:
                 new_path = Path(str(cover_path))
-                # 删除旧封面（仅在路径改变时删除，避免误删当前封面文件）
-                old_cover = conn.execute(
-                    "SELECT cover_path FROM series WHERE id = ?",
-                    (series_id,),
-                ).fetchone()
-                
-                if old_cover and old_cover["cover_path"]:
-                    try:
-                        old_path = Path(str(old_cover["cover_path"]))
-                        cover_root = COVER_ROOT.resolve()
-                        should_delete_old_cover = False
-                        if old_path.exists() and old_path != new_path:
-                            try:
-                                should_delete_old_cover = old_path.resolve().is_relative_to(cover_root)
-                            except Exception:
-                                should_delete_old_cover = False
-                        if should_delete_old_cover:
-                            old_path.unlink()
-                    except Exception:
-                        pass
-                
                 conn.execute(
                     "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (cover_path, series_id),
@@ -557,3 +623,103 @@ class LibraryService:
                     "UPDATE series SET cover_path = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (series_id,),
                 )
+
+        if old_path_text:
+            old_path = Path(old_path_text)
+            if not cover_path or str(new_path) != old_path_text:
+                clear_cover_display_cache_for_source(old_path)
+                delete_managed_cover_source(old_path)
+
+        # 每次封面变更后进行一次轻量清理，防止旧封面持续堆积。
+        self.cleanup_unused_cover_files()
+
+    def set_series_cover_index(self, series_id: int, cover_path: str) -> None:
+        """轻量更新封面索引路径，不触发封面文件清理。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (cover_path, series_id),
+            )
+
+    def cleanup_unused_cover_files(self) -> int:
+        used_internal_paths: set[Path] = set()
+        used_source_tokens: set[str] = set()
+        try:
+            cover_root = COVER_ROOT.resolve()
+        except Exception:
+            cover_root = COVER_ROOT
+
+        rows = self.db.conn.execute("SELECT cover_path FROM series WHERE cover_path IS NOT NULL").fetchall()
+        for row in rows:
+            raw = str(row["cover_path"] or "").strip()
+            if not raw:
+                continue
+            path = Path(raw)
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            used_source_tokens.add(get_cover_source_token(resolved))
+            try:
+                if resolved.is_relative_to(cover_root):
+                    used_internal_paths.add(resolved)
+            except Exception:
+                continue
+
+        removed = 0
+        removed_cover_sources: list[Path] = []
+        managed_candidates: list[Path] = []
+        if SOURCE_CACHE_ROOT.exists():
+            managed_candidates.extend(SOURCE_CACHE_ROOT.glob("source_*.png"))
+            managed_candidates.extend(SOURCE_CACHE_ROOT.glob("source_name_author_*.png"))
+        # 兼容旧版 data/covers/cover_*.png：增量清理历史文件。
+        if COVER_ROOT.exists():
+            managed_candidates.extend(COVER_ROOT.glob("cover_*.png"))
+
+        for file in managed_candidates:
+            try:
+                if not file.is_file():
+                    continue
+                resolved = file.resolve()
+                if resolved in used_internal_paths:
+                    continue
+                file.unlink()
+                removed_cover_sources.append(file)
+                removed += 1
+            except Exception:
+                continue
+
+        if removed_cover_sources:
+            # 定向清理对应封面的展示缓存，避免全量缓存清空导致大库抖动。
+            for source in removed_cover_sources:
+                try:
+                    clear_cover_display_cache_for_source(source)
+                except Exception:
+                    continue
+
+        # 清理 _scaled 下不再被引用的展示缓存文件，防止旧版本升级后堆积。
+        used_scaled_files: set[Path] = set()
+        for path in used_internal_paths:
+            try:
+                if path.is_file() and path.resolve().is_relative_to(DISPLAY_CACHE_ROOT.resolve()):
+                    used_scaled_files.add(path.resolve())
+            except Exception:
+                continue
+
+        if DISPLAY_CACHE_ROOT.exists():
+            for cached in DISPLAY_CACHE_ROOT.rglob("cover_*.png"):
+                try:
+                    if not cached.is_file():
+                        continue
+                    resolved = cached.resolve()
+                    if resolved in used_scaled_files:
+                        continue
+                    stem_parts = cached.stem.split("_")
+                    if len(stem_parts) >= 3 and stem_parts[1] in used_source_tokens:
+                        continue
+                    cached.unlink()
+                    removed += 1
+                except Exception:
+                    continue
+
+        return removed

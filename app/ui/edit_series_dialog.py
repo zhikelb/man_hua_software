@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -22,6 +24,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from app.utils.image_files import list_images_sorted
 
 
 class CoverSelector(QWidget):
@@ -237,6 +241,7 @@ class EditSeriesDialog(QDialog):
         super().__init__(parent)
         self.series_id = series_id
         self.episodes = episodes or []
+        self.new_episode_folders: list[str] = []
         self.setWindowTitle(f"编辑漫画《{name}》")
         self.resize(700, 560)
 
@@ -279,6 +284,25 @@ class EditSeriesDialog(QDialog):
             self.episode_widget = EpisodeEditorWidget(self.episodes)
             tabs.addTab(self.episode_widget, f"集信息（{len(self.episodes)}集）")
 
+        append_widget = QWidget()
+        append_layout = QVBoxLayout(append_widget)
+        append_layout.addWidget(QLabel("为当前漫画追加新集（从图片目录导入，集号自动顺延）"))
+
+        self.new_episode_list = QListWidget()
+        append_layout.addWidget(self.new_episode_list)
+
+        append_btn_row = QHBoxLayout()
+        add_episode_btn = QPushButton("添加新集目录")
+        remove_episode_btn = QPushButton("移除选中")
+        add_episode_btn.clicked.connect(self._add_new_episode_folder)
+        remove_episode_btn.clicked.connect(self._remove_selected_new_episode_folder)
+        append_btn_row.addWidget(add_episode_btn)
+        append_btn_row.addWidget(remove_episode_btn)
+        append_btn_row.addStretch()
+        append_layout.addLayout(append_btn_row)
+
+        tabs.addTab(append_widget, "添加新集")
+
         layout.addWidget(tabs)
 
         buttons = QDialogButtonBox(
@@ -287,6 +311,33 @@ class EditSeriesDialog(QDialog):
         buttons.accepted.connect(self.accept_with_validate)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _add_new_episode_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择新集图片目录", str(Path.home()))
+        if not folder:
+            return
+
+        folder_path = Path(folder)
+        images = list_images_sorted(folder_path)
+        if not images:
+            QMessageBox.warning(self, "提示", "所选目录没有可用图片")
+            return
+
+        folder_text = str(folder_path)
+        if folder_text in self.new_episode_folders:
+            QMessageBox.information(self, "提示", "该目录已添加")
+            return
+
+        self.new_episode_folders.append(folder_text)
+        self.new_episode_list.addItem(QListWidgetItem(f"{folder_path.name} ({len(images)} 张)"))
+
+    def _remove_selected_new_episode_folder(self) -> None:
+        row = self.new_episode_list.currentRow()
+        if row < 0:
+            return
+        self.new_episode_list.takeItem(row)
+        if row < len(self.new_episode_folders):
+            self.new_episode_folders.pop(row)
 
     def accept_with_validate(self) -> None:
         if not self.name_edit.text().strip():
@@ -305,7 +356,7 @@ class EditSeriesDialog(QDialog):
 
         self.accept()
 
-    def get_edited_data(self) -> tuple[str, str, str, int | None, str | None, list[dict]]:
+    def get_edited_data(self) -> tuple[str, str, str, int | None, str | None, list[dict], list[str]]:
         episode_updates: list[dict] = []
         if self.episode_widget is not None:
             episode_updates = self.episode_widget.get_episode_updates()
@@ -317,4 +368,5 @@ class EditSeriesDialog(QDialog):
             self.group_combo.currentData(),
             self.cover_selector.get_selected_cover_path(),
             episode_updates,
+            self.new_episode_folders.copy(),
         )

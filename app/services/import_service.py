@@ -602,15 +602,6 @@ class ImportService:
         if not cover_path:
             self._set_series_cover_from_first_image(series_id)
             return
-        candidate = backup_data_dir / "covers" / Path(cover_path).name
-        if candidate.exists():
-            new_cover = store_cover_image(series_id, candidate)
-            with self.db.transaction() as conn:
-                conn.execute(
-                    "UPDATE series SET cover_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (str(new_cover), series_id),
-                )
-            return
         mapped = self._resolve_backup_episode_dir(backup_data_dir, cover_path)
         if mapped is not None:
             images = list_images_sorted(mapped)

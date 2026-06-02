@@ -38,10 +38,11 @@ from app.services.import_service import ImportService
 from app.services.library_service import LibraryService, SeriesItem
 from app.services.reader_service import ReaderService
 from app.services.export_service import ExportService
+from app.services.import_service import ImportMetadata
 from app.ui.import_dialog import ImportDialog
 from app.ui.edit_series_dialog import EditSeriesDialog
 from app.ui.reader_window import ReaderWindow
-from app.utils.cover_generator import store_cover_image
+from app.utils.cover_generator import get_library_cover_cache_path, store_cover_image
 from app.utils.global_hotkey import WindowsGlobalHotkeyManager
 
 
@@ -216,10 +217,16 @@ class MainWindow(QMainWindow):
         self.config = config
         self.reader_windows: list[ReaderWindow] = []
         self.global_hotkey_manager: WindowsGlobalHotkeyManager | None = None
-        self._last_prune_check_at = 0.0
+        self._last_prune_check_at = monotonic()
         self._prune_interval_seconds = 45.0
         self._cover_icon_cache: dict[tuple[str, int, int, float], QIcon] = {}
         self._fallback_icon_cache: dict[tuple[int, int], QIcon] = {}
+        self._cover_fill_rows: list[int] = []
+        self._cover_fill_index = 0
+        self._lazy_cover_fill_on_next_reload = True
+        self._cover_fill_timer = QTimer(self)
+        self._cover_fill_timer.setSingleShot(True)
+        self._cover_fill_timer.timeout.connect(self._process_cover_fill_batch)
 
         self.setWindowTitle("漫画软件 MVP")
         self.resize(1200, 800)
@@ -229,6 +236,12 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_global_hotkeys()
+        QTimer.singleShot(0, self._initial_load)
+
+    def _initial_load(self) -> None:
+        migrated = self.library_service.migrate_legacy_cover_paths()
+        if migrated > 0:
+            self.statusBar().showMessage(f"已迁移 {migrated} 条旧封面索引到 imports 源图", 5000)
         self.reload_library()
 
     def _event_to_shortcut(self, event: QKeyEvent) -> str:
@@ -930,10 +943,55 @@ class MainWindow(QMainWindow):
         progress_map = self.library_service.get_reading_progress_map(series_ids)
 
         self.series_list.clear()
+        use_lazy_fill = self._lazy_cover_fill_on_next_reload
         for item in items:
-            self.series_list.addItem(self._build_series_item(item, progress_map.get(item.id)))
+            self.series_list.addItem(self._build_series_item(item, progress_map.get(item.id), use_lazy_fill))
 
-    def _build_series_item(self, series: SeriesItem, progress: tuple[int, int] | None) -> QListWidgetItem:
+        if use_lazy_fill:
+            self._schedule_cover_fill(items)
+        else:
+            self.series_list.viewport().update()
+
+    def _schedule_cover_fill(self, _items: list[SeriesItem]) -> None:
+        if self._cover_fill_timer.isActive():
+            self._cover_fill_timer.stop()
+        self._cover_fill_rows = list(range(self.series_list.count()))
+        self._cover_fill_index = 0
+        if self._cover_fill_rows:
+            self._cover_fill_timer.start(0)
+
+    def _process_cover_fill_batch(self) -> None:
+        if not self._cover_fill_rows:
+            return
+
+        batch_size = 8
+        count = self.series_list.count()
+        end_index = min(self._cover_fill_index + batch_size, len(self._cover_fill_rows))
+        for idx in range(self._cover_fill_index, end_index):
+            row = self._cover_fill_rows[idx]
+            if row >= count:
+                continue
+            item = self.series_list.item(row)
+            if item is None:
+                continue
+            cover_path = str(item.data(Qt.ItemDataRole.UserRole + 5) or "").strip()
+            if not cover_path:
+                continue
+            item.setIcon(self._build_cover_icon(cover_path))
+
+        self._cover_fill_index = end_index
+        if self._cover_fill_index < len(self._cover_fill_rows):
+            self._cover_fill_timer.start(12)
+        else:
+            self._lazy_cover_fill_on_next_reload = False
+            self.series_list.viewport().update()
+
+    def _build_series_item(
+        self,
+        series: SeriesItem,
+        progress: tuple[int, int] | None,
+        lazy_icon: bool,
+    ) -> QListWidgetItem:
         title = self._compose_series_title(
             name=series.name,
             author=series.author,
@@ -948,9 +1006,12 @@ class MainWindow(QMainWindow):
         list_item.setData(Qt.ItemDataRole.UserRole + 2, series.author)
         list_item.setData(Qt.ItemDataRole.UserRole + 3, series.total_episodes)
         list_item.setData(Qt.ItemDataRole.UserRole + 4, series.is_favorite)
+        list_item.setData(Qt.ItemDataRole.UserRole + 5, series.cover_path or "")
 
-        cover_icon = self._build_cover_icon(series.cover_path)
-        list_item.setIcon(cover_icon)
+        if lazy_icon:
+            list_item.setIcon(self._build_cover_icon(None))
+        else:
+            list_item.setIcon(self._build_cover_icon(series.cover_path))
         return list_item
 
     def _compose_series_title(
@@ -975,13 +1036,18 @@ class MainWindow(QMainWindow):
         icon_height = int(icon_width * 1.357)
         if cover_path and Path(cover_path).exists():
             path = Path(cover_path)
+            render_path = path
+            try:
+                render_path = get_library_cover_cache_path(path, max_width=min(icon_width, 199))
+            except Exception:
+                render_path = path
             mtime = path.stat().st_mtime
             key = (str(path), icon_width, icon_height, mtime)
             cached_icon = self._cover_icon_cache.get(key)
             if cached_icon is not None:
                 return cached_icon
 
-            pix = QPixmap(str(path))
+            pix = QPixmap(str(render_path))
             if not pix.isNull():
                 scaled = pix.scaled(
                     icon_width,
@@ -1055,6 +1121,7 @@ class MainWindow(QMainWindow):
             if details is None:
                 return
             cover_path = details.get("cover_path")
+            item.setData(Qt.ItemDataRole.UserRole + 5, str(cover_path) if cover_path else "")
             item.setIcon(self._build_cover_icon(str(cover_path) if cover_path else None))
             return
 
@@ -1086,6 +1153,7 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole + 1, name)
                 item.setData(Qt.ItemDataRole.UserRole + 2, author)
                 cover_path = details.get("cover_path")
+                item.setData(Qt.ItemDataRole.UserRole + 5, str(cover_path) if cover_path else "")
                 item.setIcon(self._build_cover_icon(str(cover_path) if cover_path else None))
 
             item.setText(
@@ -1174,7 +1242,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != EditSeriesDialog.DialogCode.Accepted:
             return
 
-        name, author, tags, group_id, cover_path, episode_updates = dialog.get_edited_data()
+        name, author, tags, group_id, cover_path, episode_updates, new_episode_folders = dialog.get_edited_data()
         try:
             self.library_service.edit_series(series_id, name, author, tags)
             
@@ -1187,6 +1255,29 @@ class MainWindow(QMainWindow):
             # 处理每集集名和顺序更新
             if episode_updates:
                 self.library_service.update_episodes_metadata(series_id, episode_updates)
+
+            if new_episode_folders:
+                current_eps = self.library_service.list_episodes(series_id)
+                next_episode_number = max((int(ep["episode_number"]) for ep in current_eps), default=0) + 1
+                next_episode_order = max((int(ep["episode_order"]) for ep in current_eps), default=0) + 1
+
+                for idx, folder_text in enumerate(new_episode_folders):
+                    folder = Path(folder_text)
+                    metadata = ImportMetadata(
+                        name=name,
+                        author=author,
+                        episode_number=next_episode_number + idx,
+                        episode_name=folder.name,
+                        episode_order=next_episode_order + idx,
+                        tags=tags,
+                        cover_source="none",
+                    )
+                    self.import_service.import_folder(
+                        folder=folder,
+                        metadata=metadata,
+                        hash_check=self.hash_check,
+                        duplicate_policy=self.duplicate_policy,
+                    )
             
             # 处理封面更新
             if cover_path is not None:
@@ -1202,7 +1293,10 @@ class MainWindow(QMainWindow):
                     self.library_service.update_series_cover(series_id, cover_path)
             
             self.reload_library()
-            self.statusBar().showMessage("漫画属性已更新", 3000)
+            if new_episode_folders:
+                self.statusBar().showMessage(f"漫画属性已更新，并新增 {len(new_episode_folders)} 集", 4000)
+            else:
+                self.statusBar().showMessage("漫画属性已更新", 3000)
         except Exception as exc:
             self._show_error("更新失败", str(exc))
 
